@@ -104,19 +104,31 @@ At finish, the assessment service gives the model the structured record (claims 
 - **Scripted model** (`LLM_PROVIDER=scripted`) is a test double used only by automated tests. It is never used in the demo path.
 - **Reviewer access** uses a separate token link shown to the interview creator after creation; there is no account system.
 - **Pause** mutes the microphone and marks a pause event; the session cap excludes paused time.
+- **Replays are capped at three per run** (`MAX_REPLAYS_PER_RUN`), on top of the 20-run session limit. A reviewer reproducing a result does not need more, and the cap keeps a report from becoming a way to spend sandbox time.
+- **`/start` rejoins a live agent** rather than starting a second one: it asks Agora whether the stored agent id is still in the channel, and on a reload mints a fresh token for the same channel and identities. A stored id Agora no longer recognises is stopped before a new agent is started, so a half-dead agent cannot hold the channel.
+- **Disputes are accepted at any time**, including during the interview when there are no findings yet, and are applied when the assessment is built: `apply_open_disputes` puts the new findings under every open dispute's hold. The original segment text is never rewritten.
+- **`compress: false` in `web/next.config.ts`** is an interim measure, not a decision. The dev server's compressor buffers small SSE frames until its buffer fills, so the browser sees nothing until the stream closes. The backend sends `Cache-Control: no-transform` on its stream routes; the flag should be removed once that is confirmed end to end.
 
 ## 10. Implementation order and status
 
-| # | Checkpoint | Status |
+Built as the twelve tasks of [the implementation plan](docs/superpowers/plans/2026-09-07-quorum-mvp.md), each one reviewed before the next was dispatched.
+
+| # | Task | Status |
 | --- | --- | --- |
-| 1 | Scenario files, checks, runner; backend scaffold, config, DB, auth, snapshots, runs with local executor; pytest for known fixtures | pending |
-| 2 | Controller, prompts, OpenAI-compatible client, Agora custom-LLM endpoint, text turns, claims, SSE | pending |
-| 3 | Agora start/stop/token/say, transcript status ingestion | pending |
-| 4 | E2B executor | pending |
-| 5 | Assessment, reference validation, disputes, replay, cleanup | pending |
-| 6 | Web: disclosure, workspace (editor, files, run output, captions, controls, voice), assessment (map, drawer, diff, rerun, dispute) | pending |
-| 7 | Playwright e2e, README, .env.example, seed and smoke scripts | pending |
-| 8 | Verify: pytest, Playwright, live voice + sandbox with real credentials | pending |
+| 1 | Backend scaffold, settings, SQLite schema, event bus | done — pytest |
+| 2 | Scenario package, checks, fixed runner, reference solutions | done — pytest |
+| 3 | Check evaluation, local and E2B executors, run and replay services | done — pytest; E2B unit-tested only |
+| 4 | Auth, interview lifecycle routes, files, runs, SSE | done — pytest |
+| 5 | Model client, scripted test double, prompts | done — pytest; the real client is tested against a fake HTTP server |
+| 6 | Conversation controller, text turns, Agora custom-LLM endpoint | done — pytest |
+| 7 | Agora voice service and `/start` wiring | done — pytest against a fake session; not exercised live |
+| 8 | Claims, links, assessment, validation, disputes, replay marking, cleanup | done — pytest |
+| 9 | Web scaffold, design tokens, API client, consent page, reviewer exchange | done — Playwright |
+| 10 | Interview workspace page | done — Playwright |
+| 11 | Assessment page: evidence map, drawer, replay, correction | done — Playwright |
+| 12 | Playwright golden flow, smoke and seed scripts, `.env.example`, README, this table | done — 400 pytest tests pass; the Playwright golden flow passes |
+
+Verification still outstanding, and blocked on credentials this build did not have: live Agora voice (interruption and role handoff with real devices), a real OpenAI-compatible model driving the prompts, and a real E2B sandbox executing a run. Everything else runs on the two labelled test doubles — `LLM_PROVIDER=scripted` and `EXECUTOR=local` — which is stated as such in the README.
 
 ## 11. Acceptance checks → tests
 

@@ -10,3 +10,5 @@ web/.env.local
 .superpowers/
 test-results/
 playwright-report/
+/.playwright-mcp/
+/t11-*.png
