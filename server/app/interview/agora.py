@@ -66,12 +66,6 @@ PARAMETERS = {
     "enable_metrics": True,
 }
 
-#: Deepgram and MiniMax run on Agora-managed credentials here, so their wire
-#: blocks carry no API key of ours and cannot satisfy the SDK's
-#: bring-your-own-key models. The SDK's own session builder skips validating
-#: exactly these two categories and sends them as a preset instead.
-MANAGED_VENDOR_CATEGORIES = frozenset({"asr", "tts"})
-
 
 @dataclass
 class JoinData:
@@ -89,7 +83,14 @@ class JoinData:
 class VoiceService(Protocol):
     enabled: bool
 
-    def make_join(self, interview_id: str) -> JoinData: ...
+    def make_join(
+        self,
+        interview_id: str,
+        *,
+        uid: int | None = None,
+        agent_uid: int | None = None,
+        agent_id: str = "",
+    ) -> JoinData: ...
 
     async def start_agent(
         self,
@@ -118,6 +119,9 @@ def _open_session(agent: Agent, join: JoinData) -> Any:
         channel=join.channel,
         agent_uid=str(join.agent_uid),
         remote_uids=[str(join.uid)],
+        # Without a name the SDK invents `agent-{unix seconds}`, which two
+        # interviews starting in the same second would share.
+        name=join.channel,
         idle_timeout=IDLE_TIMEOUT_SECONDS,
         enable_string_uid=False,
         expires_in=TOKEN_TTL_SECONDS,
@@ -143,12 +147,25 @@ class AgoraVoiceService:
         # the agent running and reachable for `stop_agent` and nothing else.
         self._sessions: dict[str, Any] = {}
 
-    def make_join(self, interview_id: str) -> JoinData:
-        """Mint the channel and the credentials for one interview's conversation."""
+    def make_join(
+        self,
+        interview_id: str,
+        *,
+        uid: int | None = None,
+        agent_uid: int | None = None,
+        agent_id: str = "",
+    ) -> JoinData:
+        """Mint the channel and the credentials for one interview's conversation.
+
+        Given the identities of a conversation already in progress, it re-mints a
+        token for that one instead of inventing a new one: a reloaded page
+        rejoins the agent it left, and the agent goes on answering the uid it was
+        started to listen to.
+        """
         channel = f"quorum-{interview_id}"
         # Two publishers share the channel: the candidate's browser and the
         # agent. The ranges keep them apart at a glance in Agora's console.
-        uid = random.randint(1_000, 9_999_999)
+        uid = uid or random.randint(1_000, 9_999_999)
         return JoinData(
             enabled=True,
             app_id=self._settings.AGORA_APP_ID,
@@ -161,7 +178,8 @@ class AgoraVoiceService:
                 uid=uid,
                 token_expire=TOKEN_TTL_SECONDS,
             ),
-            agent_uid=random.randint(10_000_000, 99_999_999),
+            agent_uid=agent_uid or random.randint(10_000_000, 99_999_999),
+            agent_id=agent_id,
         )
 
     async def start_agent(
@@ -202,22 +220,34 @@ class AgoraVoiceService:
             logger.exception("could not stop voice agent %s", agent_id)
 
     async def say(self, agent_id: str, text: str, *, interrupt: bool = False) -> None:
-        """Speak a line the model endpoint was never asked for."""
-        session = self._live(agent_id, "speak")
+        """Speak a line the model endpoint was never asked for.
+
+        Callers speak inline, in the middle of a turn, so nothing here is worth
+        raising over: a line the candidate did not hear is not a lost interview.
+        """
+        session = self._sessions.get(agent_id)
         if session is None:
+            self._not_held(agent_id, "speak")
             return
-        await session.say(
-            text,
-            priority="INTERRUPT" if interrupt else "APPEND",
-            interruptable=True,
-        )
+        try:
+            await session.say(
+                text,
+                priority="INTERRUPT" if interrupt else "APPEND",
+                interruptable=True,
+            )
+        except Exception as failure:
+            self._forget(agent_id, "speak", failure)
 
     async def interrupt(self, agent_id: str) -> None:
         """Stop the agent mid-sentence, as a person talking over it would."""
-        session = self._live(agent_id, "interrupt")
+        session = self._sessions.get(agent_id)
         if session is None:
+            self._not_held(agent_id, "interrupt")
             return
-        await session.interrupt()
+        try:
+            await session.interrupt()
+        except Exception as failure:
+            self._forget(agent_id, "interrupt", failure)
 
     def build_properties(
         self,
@@ -244,14 +274,17 @@ class AgoraVoiceService:
             greeting=greeting,
             instructions=instructions,
         )
+        # Derived, not hardcoded, so the seam cannot disagree with `start()`
+        # about which vendors are Agora-managed.
+        skip, allow_missing = session._vendor_validation_categories(None)
         return session._build_start_properties(
             {
                 "app_id": self._settings.AGORA_APP_ID,
                 "app_certificate": self._settings.AGORA_APP_CERTIFICATE,
                 "expires_in": TOKEN_TTL_SECONDS,
             },
-            MANAGED_VENDOR_CATEGORIES,
-            MANAGED_VENDOR_CATEGORIES,
+            skip,
+            allow_missing,
         )
 
     def _open(
@@ -301,13 +334,27 @@ class AgoraVoiceService:
         )
         return self._session_factory(agent, join)
 
-    def _live(self, agent_id: str, what: str) -> Any:
-        session = self._sessions.get(agent_id)
-        if session is None:
-            logger.warning(
-                "cannot %s: voice agent %s is not held by this process", what, agent_id
-            )
-        return session
+    def _not_held(self, agent_id: str, what: str) -> None:
+        logger.warning(
+            "cannot %s: voice agent %s is not held by this process", what, agent_id
+        )
+
+    def _forget(self, agent_id: str, what: str, failure: Exception) -> None:
+        """Stop holding a session that has stopped answering.
+
+        An agent that hit Agora's idle timeout is gone, and the next call would
+        raise the same way. Dropping it turns every call after this one back
+        into the quiet no-op an unheld agent gets. The message stays out of the
+        log: an SDK error can quote the request it failed on, bearer and all.
+        """
+        self._sessions.pop(agent_id, None)
+        logger.warning(
+            "could not %s: voice agent %s is no longer live (%s)",
+            what,
+            agent_id,
+            type(failure).__name__,
+        )
+        logger.debug("voice agent %s failed to %s", agent_id, what, exc_info=failure)
 
 
 class NullVoiceService:
@@ -315,7 +362,14 @@ class NullVoiceService:
 
     enabled = False
 
-    def make_join(self, interview_id: str) -> JoinData:
+    def make_join(
+        self,
+        interview_id: str,
+        *,
+        uid: int | None = None,
+        agent_uid: int | None = None,
+        agent_id: str = "",
+    ) -> JoinData:
         return JoinData(enabled=False)
 
     async def start_agent(

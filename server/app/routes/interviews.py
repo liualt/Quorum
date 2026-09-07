@@ -120,58 +120,86 @@ async def start_interview(
     interview_id: str, request: Request, row=Depends(require_candidate)
 ) -> dict:
     app = request.app
-    greeting = prompts.greeting_text(row["display_name"])
-    join = {"enabled": False}
-    voice_status = "off"
-    agora = {}
+    # A double click, or a reload landing while the first start is still in
+    # flight, must not put two agents in one channel or two greetings in the
+    # transcript. Whether an agent already exists is read and acted on here.
+    async with app.state.controller.interview_lock(interview_id):
+        # The row the dependency read can predate a start that just finished.
+        current = repo.get_interview(app.state.db, interview_id) or row
+        greeting = prompts.greeting_text(current["display_name"])
+        join, voice_status, agora = await _join_voice(app, interview_id, current, greeting)
 
+        repo.update_interview(
+            app.state.db,
+            interview_id,
+            status="live",
+            # A second start must not restart the clock the session cap runs on.
+            started_at=current["started_at"] or ids.now_iso(),
+            voice_status=voice_status,
+            **agora,
+        )
+        _ensure_greeting(app, interview_id, greeting)
+        emit(app.state.db, app.state.bus, interview_id, "voice_status", {"status": voice_status})
+        return {"voice": join}
+
+
+async def _join_voice(app, interview_id: str, row, greeting: str) -> tuple[dict, str, dict]:
+    """Put an agent in the interview's channel, and say what to record about it.
+
+    Voice is the medium, not the interview: every failure here — a malformed
+    Agora credential, an agent Agora will not start — degrades to text mode
+    instead of refusing to begin.
+    """
     voice = getattr(app.state, "voice", None)
-    if voice is not None and voice.enabled:
+    if voice is None or not voice.enabled:
+        return {"enabled": False}, "off", {}
+
+    try:
         if row["agora_agent_id"]:
-            # A reloaded page starts again; two agents in one channel would talk
-            # over each other, and the browser needs a fresh token regardless.
-            await voice.stop_agent(row["agora_agent_id"])
-        join_data = voice.make_join(interview_id)
-        try:
-            agent_id = await voice.start_agent(
-                join_data,
+            # A reload rejoins the conversation in progress rather than
+            # replacing it: same channel, same identities, a fresh token, and
+            # the agent keeps the history it already has.
+            join = voice.make_join(
+                interview_id,
+                uid=row["agora_uid"],
+                agent_uid=row["agora_agent_uid"],
+                agent_id=row["agora_agent_id"],
+            )
+        else:
+            join = voice.make_join(interview_id)
+            join.agent_id = await voice.start_agent(
+                join,
                 llm_url=_llm_url(app.state.settings, interview_id),
                 llm_token=llm_token(app.state.settings, interview_id),
                 greeting=greeting,
                 instructions=prompts.agent_instructions(),
             )
-        except Exception:
-            # Voice is the medium, not the interview. Losing it costs the
-            # candidate the microphone, and nothing else.
-            logger.exception("could not start the voice agent for %s", interview_id)
-            voice_status = "disconnected"
-            join = {"enabled": False, "reason": "the voice agent could not be reached"}
-            # Any earlier agent was stopped above; leave no id for `/finish` or
-            # a deletion to chase.
-            agora = dict.fromkeys(AGORA_COLUMNS)
-        else:
-            join_data.agent_id = agent_id
-            join = asdict(join_data)
-            voice_status = "connecting"
-            agora = {
-                "agora_channel": join_data.channel,
-                "agora_agent_id": agent_id,
-                "agora_uid": join_data.uid,
-                "agora_agent_uid": join_data.agent_uid,
-            }
+    except Exception as failure:
+        # Never the message: a pydantic ValidationError quotes the input it
+        # rejected, and the input here carries the agent's bearer token.
+        logger.error(
+            "voice is unavailable for %s: %s", interview_id, type(failure).__name__
+        )
+        logger.debug("voice failed to start for %s", interview_id, exc_info=failure)
+        # A start that failed left nothing behind. A rejoin that failed left the
+        # agent it could not rejoin, and `/finish` still has to stop that one.
+        cleared = {} if row["agora_agent_id"] else dict.fromkeys(AGORA_COLUMNS)
+        return (
+            {"enabled": False, "reason": "the voice agent could not be reached"},
+            "disconnected",
+            cleared,
+        )
 
-    repo.update_interview(
-        app.state.db,
-        interview_id,
-        status="live",
-        # A second start must not restart the clock the session cap runs on.
-        started_at=row["started_at"] or ids.now_iso(),
-        voice_status=voice_status,
-        **agora,
+    return (
+        asdict(join),
+        "connecting",
+        {
+            "agora_channel": join.channel,
+            "agora_agent_id": join.agent_id,
+            "agora_uid": join.uid,
+            "agora_agent_uid": join.agent_uid,
+        },
     )
-    _ensure_greeting(app, interview_id, greeting)
-    emit(app.state.db, app.state.bus, interview_id, "voice_status", {"status": voice_status})
-    return {"voice": join}
 
 
 def _llm_url(settings, interview_id: str) -> str:

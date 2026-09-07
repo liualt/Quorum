@@ -107,7 +107,12 @@ class InterviewController:
     def _bus(self):
         return self._app.state.bus
 
-    def _lock(self, interview_id: str) -> asyncio.Lock:
+    def interview_lock(self, interview_id: str) -> asyncio.Lock:
+        """The one lock every change to this interview's turn state runs under.
+
+        `/start` holds it too: it decides whether an agent already exists, and
+        two starts deciding that at once is how a channel ends up with two.
+        """
         return self._locks.setdefault(interview_id, asyncio.Lock())
 
     def load_state(self, interview_id: str) -> ControllerState:
@@ -182,7 +187,7 @@ class InterviewController:
         }
 
     async def _turn(self, interview_id: str, user_text: str, source: str, outcome: TurnOutcome):
-        async with self._lock(interview_id):
+        async with self.interview_lock(interview_id):
             plan = self._plan(interview_id, user_text.strip(), source, outcome)
         if plan is None:
             yield ENDED_TEXT
@@ -215,7 +220,7 @@ class InterviewController:
         finally:
             self._end_stream(interview_id, plan.generation)
 
-        async with self._lock(interview_id):
+        async with self.interview_lock(interview_id):
             self._record_role_segment(plan, "".join(pieces), status, outcome)
 
     def _end_stream(self, interview_id: str, generation: int) -> None:
@@ -370,7 +375,7 @@ class InterviewController:
         run = repo.get_run(self._db, run_id)
         if run is None or run["replay_of"]:
             return  # a replay is the reviewer's reproduction, not the candidate's work
-        async with self._lock(interview_id):
+        async with self.interview_lock(interview_id):
             state = self.load_state(interview_id)
             if run_id not in state.pending_run_ids and run_id not in state.discussed_run_ids:
                 state.pending_run_ids.append(run_id)
