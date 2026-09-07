@@ -1,0 +1,10 @@
+{"grants":[
+ {"user_id":"u_alice","document_id":"doc_acme_q3"},
+ {"user_id":"u_alice","document_id":"doc_acme_forecast"},
+ {"user_id":"u_alice","document_id":"doc_acme_onboarding"},
+ {"user_id":"u_bob","document_id":"doc_acme_q3"},
+ {"user_id":"u_bob","document_id":"doc_acme_onboarding"},
+ {"user_id":"u_carol","document_id":"doc_birch_q3"},
+ {"user_id":"u_carol","document_id":"doc_birch_roadmap"},
+ {"user_id":"u_carol","document_id":"doc_birch_handbook"}
+]}

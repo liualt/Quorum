@@ -1,0 +1,8 @@
+{"documents":[
+ {"id":"doc_acme_q3","company_id":"co_acme","title":"Q3 quarterly report","body":"Acme revenue and margin summary for the third quarter."},
+ {"id":"doc_acme_forecast","company_id":"co_acme","title":"Finance quarterly forecast","body":"Acme confidential forecast prepared by finance."},
+ {"id":"doc_acme_onboarding","company_id":"co_acme","title":"Engineering onboarding handbook","body":"How new Acme engineers get set up."},
+ {"id":"doc_birch_q3","company_id":"co_birch","title":"Q3 quarterly report","body":"Birch revenue and hiring summary for the third quarter."},
+ {"id":"doc_birch_roadmap","company_id":"co_birch","title":"Product roadmap quarterly review","body":"Birch roadmap review for the coming quarter."},
+ {"id":"doc_birch_handbook","company_id":"co_birch","title":"Employee handbook","body":"Birch policies for all employees."}
+]}

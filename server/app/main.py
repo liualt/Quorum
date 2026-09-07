@@ -2,11 +2,13 @@
 
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import Settings, get_settings
+from app.scenario import load_scenario
 from app.storage import db, repo
 from app.storage.events import EventBus
 
@@ -26,7 +28,10 @@ async def lifespan(app: FastAPI):
     # can serialize compound operations against the same lock repo writes hold.
     app.state.write_lock = repo._lock
 
-    # task 2: scenario
+    scenario_dir = Path(settings.SCENARIO_DIR)
+    if not scenario_dir.is_absolute():
+        scenario_dir = Path(__file__).resolve().parents[1] / scenario_dir
+    app.state.scenario = load_scenario(scenario_dir, settings.SCENARIO_ID)
     # task 3: executor
     # task 5: llm
     # task 6: controller

@@ -1,0 +1,17 @@
+{"version":"v1","checks":[
+ {"id":"access_filtering","name":"Permission filtering","behavior":"A user can see only documents allowed by their current permissions.","description":"Three searches by Acme users with different grants.","introduced_at":"initial",
+  "steps":[{"op":"search","user":"u_alice","query":"quarterly","expect":["doc_acme_q3","doc_acme_forecast"]},
+           {"op":"search","user":"u_bob","query":"handbook","expect":["doc_acme_onboarding"]},
+           {"op":"search","user":"u_bob","query":"forecast","expect":[]}]},
+ {"id":"cross_company_isolation","name":"Cross-company isolation","behavior":"Identical searches by different companies cannot leak documents across companies.","description":"Alice at Acme and Carol at Birch run the same query.","introduced_at":"initial",
+  "steps":[{"op":"search","user":"u_alice","query":"quarterly report","expect":["doc_acme_q3"]},
+           {"op":"search","user":"u_carol","query":"quarterly report","expect":["doc_birch_q3"]}]},
+ {"id":"revocation_next_request","name":"Revocation takes effect","behavior":"Removing a user's access takes effect on the next request, including a cached request.","description":"Alice searches, an administrator revokes one document, Alice searches again.","introduced_at":"changed_condition",
+  "steps":[{"op":"search","user":"u_alice","query":"quarterly","expect":["doc_acme_q3","doc_acme_forecast"]},
+           {"op":"revoke","user":"u_alice","document":"doc_acme_forecast"},
+           {"op":"search","user":"u_alice","query":"quarterly","expect":["doc_acme_q3"]}]},
+ {"id":"repeat_search_efficiency","name":"Repeated searches avoid work","behavior":"Repeated authorized searches avoid repeating the expensive search operation where possible.","description":"Three searches for the same query; the index may be scanned at most twice.","introduced_at":"initial","max_search_calls":2,
+  "steps":[{"op":"search","user":"u_alice","query":"quarterly","expect":["doc_acme_q3","doc_acme_forecast"]},
+           {"op":"search","user":"u_alice","query":"quarterly","expect":["doc_acme_q3","doc_acme_forecast"]},
+           {"op":"search","user":"u_bob","query":"quarterly","expect":["doc_acme_q3"]}]}
+]}

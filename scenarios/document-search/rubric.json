@@ -1,0 +1,12 @@
+{"version":"v1","dimensions":[
+ {"id":"understanding_problem","title":"Understanding the problem","guidance":"Did the candidate correctly explain how the cache can leak documents across companies and identify the affected behaviors?"},
+ {"id":"implementing_checking_fix","title":"Implementing and checking a fix","guidance":"Did the candidate change the code to address the leak and run checks to verify the result, including under access revocation?"},
+ {"id":"explaining_consequences","title":"Explaining customer and release consequences","guidance":"Did the candidate state a release decision and describe its effect on customers, including any known tradeoffs?"},
+ {"id":"responding_to_new_evidence","title":"Responding to new evidence","guidance":"Did the candidate revise their answer appropriately when given a new run result or a changed condition?"}
+],"observation_levels":["demonstrated","partly_demonstrated","not_observed"],"rules":[
+ "A machine-observed pass supports a behavior under recorded conditions only.",
+ "Represent explanation and implementation evidence separately.",
+ "Disabling caching is valid containment; note the unresolved performance objective rather than penalising it.",
+ "A changed answer after new evidence is a revision unless facts and scope were unchanged.",
+ "Never produce an overall score, ranking, or judgments about personality, emotion, accent, or honesty."
+]}
