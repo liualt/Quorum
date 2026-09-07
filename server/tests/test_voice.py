@@ -18,6 +18,7 @@ from app.interview.agora import (
     AgoraVoiceService,
     JoinData,
     NullVoiceService,
+    _open_session,
     build_voice,
 )
 from app.main import create_app
@@ -74,12 +75,28 @@ class FakeSession:
         self._record(("interrupt",))
 
 
+class FakeAgents:
+    """The `client.agents` namespace, with one canned answer about one agent."""
+
+    def __init__(self, *, status: str = "RUNNING", fails: bool = False):
+        self.status = status
+        self.fails = fails
+        self.asked: list[str] = []
+
+    async def get(self, appid: str, agent_id: str):
+        self.asked.append(agent_id)
+        if self.fails:
+            raise RuntimeError("agora is unreachable")
+        return SimpleNamespace(agent_id=agent_id, status=self.status)
+
+
 class FakeClient:
     """Stands in for `AsyncAgora`; records the agents it was asked to stop."""
 
-    def __init__(self, *, fails: bool = False):
+    def __init__(self, *, fails: bool = False, status: str = "RUNNING", blind: bool = False):
         self.fails = fails
         self.stopped: list[str] = []
+        self.agents = FakeAgents(status=status, fails=blind)
 
     async def stop_agent(self, agent_id: str) -> None:
         self.stopped.append(agent_id)
@@ -287,6 +304,52 @@ async def test_speaking_to_an_unknown_agent_is_a_warning_not_a_failure(caplog):
     assert "agent-from-a-previous-process" in caplog.text
 
 
+def test_every_attempt_asks_for_its_own_agent_name():
+    """Agora refuses a name it has already seen, so a retry cannot reuse one."""
+    sessions = []
+
+    def remember(agent, join):
+        sessions.append(_open_session(agent, join))
+        return sessions[-1]
+
+    voice = AgoraVoiceService(
+        agora_settings(), client=FakeClient(), session_factory=remember
+    )
+    join = voice.make_join("itv_1")
+
+    voice.build_properties(join, **start_kwargs())
+    voice.build_properties(join, **start_kwargs())
+
+    names = [session._name for session in sessions]
+    assert all(name.startswith("quorum-itv_1-") for name in names)
+    assert names[0] != names[1]
+
+
+@pytest.mark.parametrize(
+    ("status", "live"),
+    [
+        ("RUNNING", True),
+        ("STARTING", True),
+        ("STOPPED", False),
+        ("FAILED", False),
+        ("IDLE", False),
+    ],
+)
+async def test_agent_is_live_follows_the_status_agora_reports(status, live):
+    client = FakeClient(status=status)
+
+    assert await fake_voice(client=client).agent_is_live("agent-abc") is live
+    assert client.agents.asked == ["agent-abc"]
+
+
+async def test_an_agent_agora_will_not_talk_about_is_not_live(caplog):
+    """Unreachable, unknown, refused: none of them is an agent worth rejoining."""
+    with caplog.at_level("WARNING"):
+        assert await fake_voice(client=FakeClient(blind=True)).agent_is_live("gone") is False
+
+    assert "could not read the state of voice agent gone" in caplog.text
+
+
 async def test_stop_agent_stops_the_session_it_started():
     session = FakeSession()
     client = FakeClient()
@@ -315,12 +378,19 @@ class StubVoice:
 
     enabled = True
 
-    def __init__(self, *, fails: bool = False, fails_join: bool = False):
+    def __init__(self, *, fails: bool = False, fails_join: bool = False, live: bool = True):
         self.fails = fails
         self.fails_join = fails_join
+        self.live = live
+        self.agent_id = "agent-abc"
         self.joins: list[dict] = []
         self.started: list[dict] = []
         self.stopped: list[str] = []
+        self.asked: list[str] = []
+
+    async def agent_is_live(self, agent_id: str) -> bool:
+        self.asked.append(agent_id)
+        return self.live
 
     def make_join(self, interview_id, *, uid=None, agent_uid=None, agent_id="") -> JoinData:
         self.joins.append({"uid": uid, "agent_uid": agent_uid, "agent_id": agent_id})
@@ -351,7 +421,7 @@ class StubVoice:
                 "instructions": instructions,
             }
         )
-        return "agent-abc"
+        return self.agent_id
 
     async def stop_agent(self, agent_id: str) -> None:
         self.stopped.append(agent_id)
@@ -445,7 +515,7 @@ def test_start_launches_the_agent_and_reports_the_channel(voice_client):
     ]
 
 
-def test_starting_again_rejoins_the_running_agent(voice_client):
+def test_starting_again_rejoins_an_agent_that_is_still_live(voice_client):
     voice = StubVoice()
     voice_client.app.state.voice = voice
     interview = create_interview(voice_client)
@@ -455,11 +525,32 @@ def test_starting_again_rejoins_the_running_agent(voice_client):
 
     # One agent, joined twice: the reload got a fresh token for the identities
     # the agent is already listening to, and nothing was started or stopped.
+    assert voice.asked == ["agent-abc"]
     assert len(voice.started) == 1
     assert voice.stopped == []
     assert voice.joins[1] == {"uid": 4242, "agent_uid": 99887766, "agent_id": "agent-abc"}
     assert again.json()["voice"]["token"] == "join-token-2"
     assert again.json()["voice"]["agent_id"] == "agent-abc"
+
+
+def test_starting_again_replaces_an_agent_that_has_hung_up(voice_client):
+    """An id on the row outlives the agent: one left alone idles out after 120s."""
+    app = voice_client.app
+    voice = StubVoice()
+    app.state.voice = voice
+    interview = create_interview(voice_client)
+    voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    voice.live = False
+    voice.agent_id = "agent-second"
+    again = voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    # The dead one was stopped and a new one took the channel, rather than the
+    # candidate being handed a valid token for an agent that cannot speak.
+    assert voice.stopped == ["agent-abc"]
+    assert len(voice.started) == 2
+    assert again.json()["voice"]["agent_id"] == "agent-second"
+    assert repo.get_interview(app.state.db, interview["id"])["agora_agent_id"] == "agent-second"
 
 
 def test_start_falls_back_to_text_when_the_agent_will_not_start(voice_client):

@@ -10,6 +10,7 @@ every candidate turn — so a deployment the agent cannot reach has no voice, an
 
 import logging
 import random
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -66,6 +67,12 @@ PARAMETERS = {
     "enable_metrics": True,
 }
 
+#: The agent states worth rejoining. Everything else — `STOPPED`, `FAILED`, or
+#: some status Agora adds later — counts as gone, because starting a second
+#: agent costs a few seconds and rejoining one that is not there costs the
+#: candidate an interview nobody speaks in.
+LIVE_AGENT_STATUSES = frozenset({"STARTING", "RUNNING"})
+
 
 @dataclass
 class JoinData:
@@ -102,6 +109,8 @@ class VoiceService(Protocol):
         instructions: str,
     ) -> str: ...
 
+    async def agent_is_live(self, agent_id: str) -> bool: ...
+
     async def stop_agent(self, agent_id: str) -> None: ...
 
     async def say(self, agent_id: str, text: str, *, interrupt: bool = False) -> None: ...
@@ -120,8 +129,11 @@ def _open_session(agent: Agent, join: JoinData) -> Any:
         agent_uid=str(join.agent_uid),
         remote_uids=[str(join.uid)],
         # Without a name the SDK invents `agent-{unix seconds}`, which two
-        # interviews starting in the same second would share.
-        name=join.channel,
+        # interviews starting in the same second would share. Agora will not
+        # take the same name twice, so the suffix is per attempt, not per
+        # interview: a start that failed after Agora made the agent must not
+        # poison every retry.
+        name=f"{join.channel}-{secrets.token_hex(4)}",
         idle_timeout=IDLE_TIMEOUT_SECONDS,
         enable_string_uid=False,
         expires_in=TOKEN_TTL_SECONDS,
@@ -203,6 +215,29 @@ class AgoraVoiceService:
         self._sessions[agent_id] = session
         logger.info("voice agent %s joined channel %s", agent_id, join.channel)
         return agent_id
+
+    async def agent_is_live(self, agent_id: str) -> bool:
+        """Whether Agora still has this agent in a channel.
+
+        An agent hangs up by itself after `IDLE_TIMEOUT_SECONDS` with nobody
+        there, so a stored id outlives the agent it names whenever a browser is
+        away that long — a reload and a walk, a sleeping laptop, a dropped
+        connection. Asking costs one round trip; assuming costs a session where
+        the candidate holds a valid token and nothing ever speaks.
+        """
+        try:
+            info = await self._client.agents.get(self._settings.AGORA_APP_ID, agent_id)
+        except Exception as failure:
+            # Unreachable, unknown id, refused: none of them are an agent to
+            # rejoin, and the caller's answer to all three is to start a new one.
+            logger.warning(
+                "could not read the state of voice agent %s (%s)",
+                agent_id,
+                type(failure).__name__,
+            )
+            logger.debug("voice agent %s state unreadable", agent_id, exc_info=failure)
+            return False
+        return getattr(info, "status", None) in LIVE_AGENT_STATUSES
 
     async def stop_agent(self, agent_id: str) -> None:
         """Take the agent out of the channel; an interview ends either way."""
@@ -371,6 +406,9 @@ class NullVoiceService:
         agent_id: str = "",
     ) -> JoinData:
         return JoinData(enabled=False)
+
+    async def agent_is_live(self, agent_id: str) -> bool:
+        return False
 
     async def start_agent(
         self,

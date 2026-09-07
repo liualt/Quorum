@@ -154,8 +154,11 @@ async def _join_voice(app, interview_id: str, row, greeting: str) -> tuple[dict,
     if voice is None or not voice.enabled:
         return {"enabled": False}, "off", {}
 
+    stored = row["agora_agent_id"]
+    # An id on the row is not an agent in the channel: one left alone hangs up.
+    rejoining = bool(stored) and await voice.agent_is_live(stored)
     try:
-        if row["agora_agent_id"]:
+        if rejoining:
             # A reload rejoins the conversation in progress rather than
             # replacing it: same channel, same identities, a fresh token, and
             # the agent keeps the history it already has.
@@ -163,9 +166,13 @@ async def _join_voice(app, interview_id: str, row, greeting: str) -> tuple[dict,
                 interview_id,
                 uid=row["agora_uid"],
                 agent_uid=row["agora_agent_uid"],
-                agent_id=row["agora_agent_id"],
+                agent_id=stored,
             )
         else:
+            if stored:
+                # Gone, or gone as far as Agora will admit. Stopping it is how a
+                # half-dead agent stops holding the channel.
+                await voice.stop_agent(stored)
             join = voice.make_join(interview_id)
             join.agent_id = await voice.start_agent(
                 join,
@@ -181,9 +188,10 @@ async def _join_voice(app, interview_id: str, row, greeting: str) -> tuple[dict,
             "voice is unavailable for %s: %s", interview_id, type(failure).__name__
         )
         logger.debug("voice failed to start for %s", interview_id, exc_info=failure)
-        # A start that failed left nothing behind. A rejoin that failed left the
-        # agent it could not rejoin, and `/finish` still has to stop that one.
-        cleared = {} if row["agora_agent_id"] else dict.fromkeys(AGORA_COLUMNS)
+        # A start that failed left nothing behind, and any stale id was stopped
+        # above. A rejoin that failed left the agent it could not rejoin
+        # running, and `/finish` still has to stop that one.
+        cleared = {} if rejoining else dict.fromkeys(AGORA_COLUMNS)
         return (
             {"enabled": False, "reason": "the voice agent could not be reached"},
             "disconnected",
