@@ -29,6 +29,20 @@ MESSAGES = [{"role": "system", "content": "# quorum-task: spoken_turn"},
             {"role": "user", "content": "hello"}]
 
 
+class TrackingStream(httpx2.AsyncByteStream):
+    """An SSE body that records whether the response was closed."""
+
+    def __init__(self):
+        self.closed = False
+
+    async def __aiter__(self):
+        for line in SSE_BODY.splitlines(keepends=True):
+            yield line.encode()
+
+    async def aclose(self):
+        self.closed = True
+
+
 def json_body(content: str) -> dict:
     return {
         "id": "x",
@@ -91,6 +105,28 @@ async def test_stream_text_yields_each_delta_in_order(fake_openai, recording_han
     assert requests[0]["temperature"] == 0.2
     assert requests[0]["max_tokens"] == 90
     assert requests[0]["messages"] == MESSAGES
+
+
+async def test_stream_text_closes_the_stream_when_the_caller_stops_early(fake_openai):
+    """An interrupted turn abandons the generator; the connection must be released."""
+    bodies = []
+
+    def handler(request):
+        body = TrackingStream()
+        bodies.append(body)
+        return httpx2.Response(
+            200, stream=body, headers={"content-type": "text/event-stream"}
+        )
+
+    chunks = fake_openai(handler).stream_text(MESSAGES)
+    first = await anext(chunks)
+
+    assert first == "Hello"
+    assert bodies[0].closed is False
+
+    await chunks.aclose()
+
+    assert bodies[0].closed is True
 
 
 async def test_complete_json_parses_the_body_and_asks_for_json_mode(
@@ -315,6 +351,19 @@ async def test_scripted_claims_marks_hedged_text_as_vague():
     assert all(claim["clarity"] == "vague" for claim in payload["claims"])
 
 
+async def test_scripted_claims_ignores_keywords_buried_in_other_words():
+    payload = await claims("Your latest note about the threshold was helpful.")
+
+    assert payload["claims"] == []
+
+
+async def test_scripted_claims_still_matches_inflected_keywords():
+    payload = await claims("The cache leaks, and an entry stays stale after a revoked grant.")
+    scopes = [claim["scope"] for claim in payload["claims"]]
+
+    assert scopes == ["cross_company", "revocation"]
+
+
 async def test_scripted_claims_returns_nothing_for_small_talk():
     payload = await claims("Give me a moment to read this.")
 
@@ -370,7 +419,8 @@ async def test_scripted_assessment_grades_from_runs_then_claims():
     levels = {entry["dimension"]: entry["observation_level"] for entry in (await assessment())["dimensions"]}
 
     # access_filtering passed in the record's run, cross-company failed but has a claim,
-    # and nothing touches revocation.
+    # and nothing touches revocation. The prompt carries run digests, not raw results,
+    # so the pass has to be read off `passed_checks`.
     assert levels["implementing_checking_fix"] == "demonstrated"
     assert levels["understanding_problem"] == "partly_demonstrated"
     assert levels["responding_to_new_evidence"] == "not_observed"

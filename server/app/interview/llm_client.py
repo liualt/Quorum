@@ -9,6 +9,7 @@ and end-to-end tests.
 """
 
 import json
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol
@@ -54,12 +55,15 @@ class OpenAICompatibleClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
+            # An interrupted turn abandons this generator mid-stream, so the
+            # connection has to be released on the way out, not at collection.
+            async with stream:
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        yield delta
         except (openai.OpenAIError, httpx2.HTTPError) as error:
             raise LLMError(f"streaming completion failed: {error}") from error
 
@@ -111,6 +115,22 @@ CLAIM_RULES: tuple[tuple[tuple[str, ...], str, str], ...] = (
 )
 VAGUE_WORDS = ("not sure", "maybe", "might", "i think", "unclear")
 REVISION_WORDS = ("actually", "i was wrong", "changed my mind")
+
+
+def _mentions(lowered: str, keywords: tuple[str, ...]) -> bool:
+    """Whether any keyword appears as a word, not buried inside another one.
+
+    A single word matches at a word boundary and keeps its inflections, so
+    "leaks" and "revoked" count while "latest" and "threshold" do not. Phrases
+    are matched as written.
+    """
+    return any(
+        keyword in lowered
+        if " " in keyword
+        else re.search(rf"\b{re.escape(keyword)}", lowered) is not None
+        for keyword in keywords
+    )
+
 
 COVERED_KEYS = (
     "initial_explanation",
@@ -213,12 +233,12 @@ def scripted_claims(system: str, candidate_text: str) -> dict:
     lowered = candidate_text.lower()
     stage = prompts.read_block(system, prompts.BLOCK_STAGE) or ""
     prior = prompts.read_json_block(system, prompts.BLOCK_PRIOR_CLAIMS, default=[]) or []
-    clarity = "vague" if any(word in lowered for word in VAGUE_WORDS) else "clear"
-    revising = any(word in lowered for word in REVISION_WORDS)
+    clarity = "vague" if _mentions(lowered, VAGUE_WORDS) else "clear"
+    revising = _mentions(lowered, REVISION_WORDS)
 
     claims = []
     for keywords, claim_type, scope in CLAIM_RULES:
-        if not any(keyword in lowered for keyword in keywords):
+        if not _mentions(lowered, keywords):
             continue
         revised = _prior_claim_id(prior, scope) if revising else None
         claims.append(
@@ -254,12 +274,8 @@ def _prior_claim_id(prior: list[dict], scope: str) -> str | None:
 
 
 def _passing_check_ids(runs: list[dict]) -> set[str]:
-    return {
-        result["check_id"]
-        for run in runs
-        for result in (run.get("results") or [])
-        if result.get("passed")
-    }
+    """Checks that passed, read off the run digests the record block carries."""
+    return {check_id for run in runs for check_id in (run.get("passed_checks") or [])}
 
 
 def _observation_level(evidence: DimensionEvidence, passing: set[str], claims: list[dict]) -> str:

@@ -8,7 +8,9 @@ takes the *first* header it finds, so untrusted text cannot forge a block. The
 `## files` and `## transcript` sections use the same header style but are prose,
 not blocks: nothing parses them.
 
-`assessment_messages` expects `record` shaped as::
+`assessment_messages` accepts the full record and bounds it before it reaches the
+prompt (PRD section 9: bounded structured state, not every event and file). It
+expects::
 
     {"interview": {"id", "display_name", "stage", ...},
      "state": {...controller state...},
@@ -17,6 +19,14 @@ not blocks: nothing parses them.
      "claims": [{"id", "segment_id", "statement", "claim_type", "scope", "stage", "clarity"}],
      "snapshots": [{"id", "content_hash", "created_at"}],
      "hint_segment_ids": ["seg_..."]}
+
+and `bounded_record` reduces it to what the model reads, so step lists, stdout and
+stderr excerpts never reach the prompt::
+
+    {"interview": ..., "state": ..., "snapshots": ..., "hint_segment_ids": ...,
+     "segments": [{"id", "speaker", "kind", "stage", "text"}],   # text <= 400 chars
+     "runs": [run_digest(run)],                                  # see `run_digest`
+     "claims": [{...same keys..., "statement"}]}                 # statement <= 400 chars
 """
 
 import json
@@ -218,7 +228,7 @@ Return one JSON object with exactly this shape:
                "supporting_refs": [], "opposing_refs": [], "assistance": "...", "uncertainty": "...", "follow_up": "..."}]}
 
 Rules:
-- Return exactly four entries in `dimensions`, one per dimension, in the fixed order listed above.
+- Return exactly four entries in `dimensions`, one per dimension, in the fixed order listed below.
 - Return at most six expanded findings in `findings`. Fewer is fine; return none if the record
   does not support any.
 - Every explanation must cite at least one ref, and every ref must be an id from the reference
@@ -289,6 +299,36 @@ def run_digest(run: dict) -> dict:
         "passed_checks": [r["check_id"] for r in results if r.get("passed")],
         "failed_checks": [r["check_id"] for r in results if not r.get("passed")],
         "notes": notes,
+    }
+
+
+TEXT_LIMIT = 400
+
+
+def bounded_record(record: dict) -> dict:
+    """The interview record trimmed to ids, run digests, and bounded text.
+
+    A RunView carries every step and up to 64 KB of captured output; none of that
+    belongs in a prompt, and the reference list below the block must not restate
+    what the block already says.
+    """
+    return {
+        **record,
+        "segments": [
+            {
+                "id": segment["id"],
+                "speaker": segment.get("speaker"),
+                "kind": segment.get("kind"),
+                "stage": segment.get("stage"),
+                "text": _one_line(segment.get("text"), TEXT_LIMIT),
+            }
+            for segment in record.get("segments", [])
+        ],
+        "runs": [run_digest(run) for run in record.get("runs", [])],
+        "claims": [
+            {**claim, "statement": _one_line(claim.get("statement"), TEXT_LIMIT)}
+            for claim in record.get("claims", [])
+        ],
     }
 
 
@@ -389,31 +429,30 @@ def _rubric_section(rubric: dict) -> str:
 
 
 def _reference_lines(record: dict) -> str:
-    lines = ["Every id you may reference, and what it is:"]
+    lines = [
+        (
+            "Every id you may reference, and what it is. The record block above holds "
+            "their content; these lines do not repeat it:"
+        )
+    ]
     for segment in record.get("segments", []):
         lines.append(
             f"- segment {segment['id']} — {speaker_label(segment.get('speaker'))} "
-            f"{segment.get('kind', 'turn')} in {segment.get('stage', 'unknown')} stage: "
-            f'"{_one_line(segment.get("text"))}"'
+            f"{segment.get('kind', 'turn')} in {segment.get('stage', 'unknown')} stage"
         )
     for run in record.get("runs", []):
-        digest = run_digest(run)
-        passed = ", ".join(digest["passed_checks"]) or "none"
-        failed = ", ".join(digest["failed_checks"]) or "none"
         lines.append(
-            f"- run {run['id']} — {digest['status']} run of snapshot "
-            f"{digest['snapshot_id']}; passed: {passed}; failed: {failed}"
+            f"- run {run['id']} — {run.get('status')} run of snapshot "
+            f"{run.get('snapshot_id')}"
         )
     for claim in record.get("claims", []):
         lines.append(
             f"- claim {claim['id']} — {claim.get('claim_type')} about {claim.get('scope')} "
-            f'({claim.get("clarity")}), from segment {claim.get("segment_id")}: '
-            f'"{_one_line(claim.get("statement"))}"'
+            f"({claim.get('clarity')}), from segment {claim.get('segment_id')}"
         )
     for snapshot in record.get("snapshots", []):
         lines.append(
-            f"- snapshot {snapshot['id']} — saved code, hash {snapshot.get('content_hash')}, "
-            f"{snapshot.get('created_at')}"
+            f"- snapshot {snapshot['id']} — saved code from {snapshot.get('created_at')}"
         )
     hints = record.get("hint_segment_ids") or []
     lines.append(
@@ -429,7 +468,7 @@ def assessment_messages(rubric: dict, record: dict) -> list[dict]:
             _header(TASK_ASSESSMENT),
             ASSESSMENT_INSTRUCTIONS,
             _rubric_section(rubric),
-            render_block(BLOCK_RECORD, record),
+            render_block(BLOCK_RECORD, bounded_record(record)),
             _reference_lines(record),
         ]
     )

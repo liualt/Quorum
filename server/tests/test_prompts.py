@@ -276,8 +276,42 @@ def test_assessment_prompt_lists_every_referenceable_id_with_a_description():
 
     for ref_id in ("seg_1", "seg_2", "run_1", "clm_1", "snap_1"):
         assert ref_id in text
-    assert "The cache is keyed by the query only." in text
-    assert "abc123" in text
+    assert "- segment seg_2 — Candidate turn in initial_review stage" in text
+    assert "- run run_1 — completed run of snapshot snap_1" in text
+    assert "- claim clm_1 — diagnosis about cross_company (clear), from segment seg_2" in text
+    assert "- snapshot snap_1 — saved code from 2026-09-07T10:00:00.000Z" in text
+
+
+def test_assessment_prompt_bounds_the_record_it_sends():
+    text = system_text(prompts.assessment_messages(RUBRIC, RECORD))
+    record = prompts.read_json_block(text, prompts.BLOCK_RECORD)
+
+    assert record["runs"] == [prompts.run_digest(RUN)]
+    assert "steps" not in json.dumps(record)
+    assert "stdout_excerpt" not in json.dumps(record)
+    assert set(record["segments"][0]) == {"id", "speaker", "kind", "stage", "text"}
+    assert record["snapshots"] == RECORD["snapshots"]
+    assert record["hint_segment_ids"] == ["seg_9"]
+
+
+def test_assessment_prompt_does_not_repeat_the_record_in_the_reference_list():
+    text = system_text(prompts.assessment_messages(RUBRIC, RECORD))
+
+    assert text.count("The cache is keyed by the query only.") == 1
+    assert text.count("The cache leaks across companies.") == 1
+
+
+def test_bounded_record_truncates_long_text():
+    long_record = dict(
+        RECORD,
+        segments=[dict(SEGMENTS[0], text="word " * 500)],
+        claims=[dict(RECORD["claims"][0], statement="word " * 500)],
+    )
+    bounded = prompts.bounded_record(long_record)
+
+    assert len(bounded["segments"][0]["text"]) == prompts.TEXT_LIMIT
+    assert bounded["segments"][0]["text"].endswith("...")
+    assert len(bounded["claims"][0]["statement"]) == prompts.TEXT_LIMIT
 
 
 def test_assessment_prompt_states_the_rubric_rules_and_dimensions_in_order():
@@ -289,6 +323,8 @@ def test_assessment_prompt_states_the_rubric_rules_and_dimensions_in_order():
                                   "explaining_consequences", "responding_to_new_evidence")
     assert "A machine-observed pass supports a behavior under recorded conditions only." in text
     assert "Explained the leak?" in text
+    # The rules point down the page at the dimension list, not up at nothing.
+    assert text.index("listed below") < text.index("Dimensions, in the fixed order")
 
 
 def test_assessment_prompt_states_the_output_limits():
