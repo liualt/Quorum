@@ -1,9 +1,11 @@
-import { ComingSoon } from "@/components/ui/ComingSoon";
+import { Workspace } from "@/components/workspace/Workspace";
 
-/** Placeholder for the interview workspace (task 10). */
-export default async function InterviewPage(
-  props: PageProps<"/interview/[id]">,
-) {
+/**
+ * The interview workspace. Everything on it needs the browser — the session
+ * cookie, the event stream, the editor, the microphone — so the page only
+ * unwraps the route param and hands it to the client component.
+ */
+export default async function InterviewPage(props: PageProps<"/interview/[id]">) {
   const { id } = await props.params;
-  return <ComingSoon title="Interview workspace" idLabel="Interview" id={id} />;
+  return <Workspace id={id} />;
 }
