@@ -1,10 +1,11 @@
 "use client";
 
-import { ArrowRight, Warning } from "@phosphor-icons/react/ssr";
-import { useId, useState } from "react";
+import { ArrowRight } from "@phosphor-icons/react/ssr";
+import { useEffect, useId, useRef, useState } from "react";
 
 import { Button, ButtonLink } from "@/components/ui/Button";
 import { CopyField } from "@/components/ui/CopyField";
+import { ErrorText } from "@/components/ui/ErrorText";
 import { Panel } from "@/components/ui/Panel";
 import { ApiError, createInterview } from "@/lib/api";
 import type { CreateInterviewResult } from "@/lib/types";
@@ -12,6 +13,20 @@ import type { CreateInterviewResult } from "@/lib/types";
 /** The wording the candidate agrees to. Do not paraphrase it. */
 const CONSENT_TEXT =
   "I understand that AI interviewers will question me and that my speech and code will be processed to produce an assessment";
+
+/**
+ * Names what is still missing, so the hint under a disabled button matches the
+ * reason it is disabled. `noValidate` is set on the form, so the browser will
+ * not say this for us.
+ */
+function blockedReason(hasName: boolean, consented: boolean): string | null {
+  if (!hasName && !consented) {
+    return "Enter a display name and tick the consent box to enable this button.";
+  }
+  if (!hasName) return "Enter a display name to enable this button.";
+  if (!consented) return "Tick the consent box to enable this button.";
+  return null;
+}
 
 export function ConsentForm() {
   const nameId = useId();
@@ -30,7 +45,8 @@ export function ConsentForm() {
   }
 
   const trimmedName = displayName.trim();
-  const canSubmit = consented && trimmedName.length > 0 && !submitting;
+  const blocked = blockedReason(trimmedName.length > 0, consented);
+  const canSubmit = blocked === null && !submitting;
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -67,7 +83,7 @@ export function ConsentForm() {
             value={displayName}
             onChange={(event) => setDisplayName(event.target.value)}
             aria-describedby={nameHintId}
-            className="border-border bg-background text-foreground min-h-11 w-full
+            className="border-border-strong bg-background text-foreground min-h-11 w-full
               rounded-lg border px-3 text-base transition-colors duration-200
               placeholder:text-muted-foreground focus:border-accent"
             placeholder="e.g. Ada, or Candidate 7"
@@ -82,7 +98,7 @@ export function ConsentForm() {
             rather than the 24px box-glyph inside it. */}
         <label
           htmlFor={consentId}
-          className="border-border bg-background hover:border-accent flex cursor-pointer
+          className="border-border-strong bg-background hover:border-accent flex cursor-pointer
             items-start gap-3 rounded-lg border p-4 text-sm transition-colors duration-200"
         >
           <input
@@ -96,15 +112,7 @@ export function ConsentForm() {
           <span>{CONSENT_TEXT}</span>
         </label>
 
-        {error ? (
-          <p
-            role="alert"
-            className="text-destructive flex items-start gap-2 text-sm"
-          >
-            <Warning size={18} aria-hidden className="mt-0.5 shrink-0" />
-            {error}
-          </p>
-        ) : null}
+        {error ? <ErrorText>{error}</ErrorText> : null}
 
         <div className="flex flex-wrap items-center gap-3">
           <Button
@@ -116,9 +124,7 @@ export function ConsentForm() {
             {submitting ? "Creating interview…" : "Create interview"}
           </Button>
           <p id={submitHintId} className="text-muted-foreground text-sm">
-            {consented
-              ? "Creates a session and takes you to the workspace."
-              : "Tick the box above to enable this button."}
+            {blocked ?? "Creates a session and takes you to the workspace."}
           </p>
         </div>
       </form>
@@ -127,6 +133,14 @@ export function ConsentForm() {
 }
 
 function InterviewCreated({ result }: { result: CreateInterviewResult }) {
+  // Submitting unmounted the button that had focus. Without this, the keyboard
+  // position falls back to the top of the document and a screen reader is left
+  // on content that no longer exists.
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    headingRef.current?.focus();
+  }, []);
+
   // The token only reaches the browser once, so the shareable link is built
   // here rather than fetched again later.
   const reviewerUrl =
@@ -135,7 +149,7 @@ function InterviewCreated({ result }: { result: CreateInterviewResult }) {
       : new URL(result.reviewer_path, window.location.origin).toString();
 
   return (
-    <Panel title="Interview created">
+    <Panel title="Interview created" headingRef={headingRef} role="status">
       <div className="grid gap-6">
         <p className="text-muted-foreground text-sm">
           Session{" "}

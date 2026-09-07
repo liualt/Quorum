@@ -18,6 +18,13 @@ const MAX_RETRY_MS = 10_000;
  *
  * `onEvent` is read through a ref, so passing an inline callback does not tear
  * the connection down and lose the cursor on every render.
+ *
+ * **Consumers must handle events idempotently.** The cursor lives in the effect,
+ * so it restarts at 0 on every mount and the backend replays the interview's
+ * whole history — a remount, a route change back into the workspace, or React's
+ * StrictMode double-mount in development all redeliver events already seen.
+ * Key state by `seq` or by the record id inside the payload (`segment.id`,
+ * `run.id`); never append to a list or increment a counter on arrival.
  */
 export function useSessionEvents(
   interviewId: string | null,

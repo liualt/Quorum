@@ -1,10 +1,10 @@
 "use client";
 
-import { Warning } from "@phosphor-icons/react/ssr";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { ButtonLink } from "@/components/ui/Button";
+import { ErrorText } from "@/components/ui/ErrorText";
 import { Panel } from "@/components/ui/Panel";
 import { ApiError, exchangeToken } from "@/lib/api";
 
@@ -47,13 +47,7 @@ export function ReviewExchange({ token }: { token: string }) {
       {error ? (
         <Panel title="Reviewer link not accepted">
           <div className="grid gap-4">
-            <p
-              role="alert"
-              className="text-destructive flex items-start gap-2 text-sm"
-            >
-              <Warning size={18} aria-hidden className="mt-0.5 shrink-0" />
-              {error}
-            </p>
+            <ErrorText>{error}</ErrorText>
             <p className="text-muted-foreground text-sm">
               Reviewer links are shown once, when the interview is created. Ask
               the candidate for a new one.

@@ -471,8 +471,8 @@ def mark_findings_needing_review(conn, bus, interview_id, ref_type, ref_id, reas
 #   app.state.mark_findings_needing_review(interview_id, ref_type, ref_id, reason)
 def clear_review_reason(conn, bus, interview_id, reason) -> None
 # cleanup.py (server/app/cleanup.py)
-def delete_interview(app, interview_id: str) -> None
-def expire_interviews(app, now_iso: str) -> int
+async def delete_interview(app, interview_id: str) -> None     # awaits voice.stop_agent
+async def expire_interviews(app, now_iso: str) -> int          # hourly via background.spawn_periodic
 ```
 
 Assessment JSON the model must return:

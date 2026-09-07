@@ -61,7 +61,7 @@ export function CopyField({ label, hint, value, id }: CopyFieldProps) {
           value={value}
           aria-describedby={hintId}
           onFocus={(event) => event.currentTarget.select()}
-          className="border-border bg-background text-foreground min-h-11 min-w-0 flex-1
+          className="border-border-strong bg-background text-foreground min-h-11 min-w-0 flex-1
             rounded-lg border px-3 font-mono text-sm"
         />
         <Button variant="secondary" onClick={copy}>

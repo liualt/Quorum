@@ -21,7 +21,7 @@ const VARIANTS: Record<ButtonVariant, string> = {
   primary:
     "border-transparent bg-accent text-on-accent hover:not-disabled:bg-accent/90",
   secondary:
-    "border-border bg-transparent text-foreground hover:not-disabled:bg-muted",
+    "border-border-strong bg-transparent text-foreground hover:not-disabled:bg-muted",
   ghost:
     "border-transparent bg-transparent text-muted-foreground " +
     "hover:not-disabled:bg-muted hover:not-disabled:text-foreground",

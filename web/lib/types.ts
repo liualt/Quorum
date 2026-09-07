@@ -170,23 +170,34 @@ export interface SnapshotView {
   created_at: string;
 }
 
+/**
+ * One step of a check. Every field but `index` and `op` can be null: when the
+ * runner returns no result for a step, `checks.py::_step_result` fills it with
+ * nulls rather than inventing a failure. `ok: null` therefore means "not
+ * observed", which is not the same as "failed" — render it as unknown.
+ */
 export interface CheckStepResult {
   index: number;
   op: string;
   /** Document ids the step expected. Null for a step with nothing to compare. */
   expected: string[] | null;
   actual: string[] | null;
-  ok: boolean;
+  ok: boolean | null;
   error: string | null;
 }
 
+/**
+ * One check's outcome. The counters are null when the check has no search
+ * budget or the runner reported none, and `efficiency_ok` is null when there
+ * was no budget to judge against — again "not measured", not "within budget".
+ */
 export interface CheckResultDict {
   check_id: string;
   passed: boolean;
   steps: CheckStepResult[];
-  search_calls: number;
-  max_search_calls: number;
-  efficiency_ok: boolean;
+  search_calls: number | null;
+  max_search_calls: number | null;
+  efficiency_ok: boolean | null;
   error: string | null;
 }
 

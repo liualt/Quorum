@@ -1,36 +1,60 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Quorum web
 
-## Getting Started
+The candidate and reviewer front end: the consent page, the interview workspace
+and the assessment report. Next.js 16 (App Router, Turbopack) with Tailwind 4.
 
-First, run the development server:
+## Running it
+
+The app is a front end only — it needs the FastAPI backend in `../server`
+running, or every page past `/` will fail. Start that first:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cd ../server
+LLM_PROVIDER=scripted EXECUTOR=local SESSION_SECRET=dev \
+DATABASE_PATH=./data/dev.db SNAPSHOT_DIR=./data/dev-snapshots \
+uv run uvicorn app.main:create_app --factory --port 8000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then, in this directory:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npm install
+cp .env.local.example .env.local   # only if the backend is not on :8000
+npm run dev                        # http://localhost:3000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+`BACKEND_URL` (default `http://localhost:8000`) is the only environment
+variable. `next.config.ts` rewrites `/api/*` and `/llm/*` to it, so the browser
+only ever talks to the Next.js origin — that keeps the session cookie
+first-party and satisfies the backend's same-origin check on mutations. Point a
+deployment at a different backend by setting `BACKEND_URL`; nothing else changes.
 
-## Learn More
+## Checks
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm run lint        # ESLint (next/core-web-vitals + typescript)
+npx tsc --noEmit    # types; run `npx next typegen` first on a fresh checkout
+npm run build       # production build, which runs typegen and tsc itself
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Layout
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Path | What lives there |
+| --- | --- |
+| `app/` | Routes. Pages are server components; `"use client"` sits on leaves. |
+| `app/globals.css` | The design tokens, and the measured contrast table behind them. |
+| `components/ui/` | Shared primitives — `Button`, `Chip`, `Panel`, `AIBadge`, … |
+| `lib/types.ts` | Wire types mirroring the backend's views by name. |
+| `lib/api.ts` | The only module that calls `fetch`. One function per route. |
+| `lib/events.ts` | `useSessionEvents` — the SSE subscription. |
 
-## Deploy on Vercel
+Two conventions worth knowing before editing:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- **Colour comes from tokens, never a literal.** `app/globals.css` records the
+  measured contrast ratio for every pairing; `--color-border` is decorative and
+  `--color-border-strong` is for control boundaries, because only the latter
+  clears 3:1.
+- **`AIBadge` is the single component that renders the "AI" label.** Disclosure
+  is a product commitment, so it looks and reads the same everywhere.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Design rules live in `../design-system/quorum/MASTER.md`.
