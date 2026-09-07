@@ -8,7 +8,7 @@ the `app`/`client` fixtures otherwise go unexercised in this task.
 import threading
 
 
-def test_health_reports_the_executor_and_placeholders_for_later_tasks(client):
+def test_health_reports_the_executor_the_model_and_placeholders_for_later_tasks(client):
     response = client.get("/api/health")
 
     assert response.status_code == 200
@@ -16,7 +16,7 @@ def test_health_reports_the_executor_and_placeholders_for_later_tasks(client):
         "status": "ok",
         "executor": "local",
         "llm_provider": "scripted",
-        "llm_model": "",
+        "llm_model": "scripted-test-double",
         "voice_enabled": False,
     }
 
@@ -26,3 +26,4 @@ def test_lifespan_sets_core_app_state(app, client):
     assert app.state.db is not None
     assert app.state.bus is not None
     assert isinstance(app.state.write_lock, type(threading.Lock()))
+    assert app.state.llm.model_id == "scripted-test-double"

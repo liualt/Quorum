@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import Settings, get_settings
 from app.execution.executor import build_executor
+from app.interview.llm_client import build_llm
 from app.routes import auth, events, files, interviews, runs
 from app.scenario import load_scenario
 from app.storage import db, repo
@@ -35,7 +36,7 @@ async def lifespan(app: FastAPI):
         scenario_dir = Path(__file__).resolve().parents[1] / scenario_dir
     app.state.scenario = load_scenario(scenario_dir, settings.SCENARIO_ID)
     app.state.executor = build_executor(settings)
-    # task 5: llm
+    app.state.llm = build_llm(settings)
     # task 6: controller
     # task 7: voice
 
@@ -73,11 +74,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/health")
     async def health():
         executor = getattr(app.state, "executor", None)
+        llm = getattr(app.state, "llm", None)
         return {
             "status": "ok",
             "executor": getattr(executor, "name", "none"),
             "llm_provider": settings.LLM_PROVIDER,
-            "llm_model": settings.LLM_MODEL,
+            "llm_model": getattr(llm, "model_id", settings.LLM_MODEL),
             "voice_enabled": settings.voice_configured,
         }
 
