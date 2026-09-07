@@ -7,6 +7,10 @@ import type { NextConfig } from "next";
 const backendUrl = process.env.BACKEND_URL ?? "http://localhost:8000";
 
 const nextConfig: NextConfig = {
+  // The proxied event stream must not be gzipped: the compressor holds each
+  // small SSE frame back until its buffer fills, so the browser sees nothing
+  // until the connection closes. Compression belongs at the edge, not here.
+  compress: false,
   async rewrites() {
     return [
       { source: "/api/:path*", destination: `${backendUrl}/api/:path*` },
