@@ -39,6 +39,8 @@ RECOVERY_TEXT = "Give me a moment, I lost my train of thought. Could you say tha
 
 # Statuses in which the panel still speaks; `finishing` and `finished` get ENDED_TEXT.
 ACCEPTING_TURNS = ("created", "live")
+#: How claim-extraction tasks are named, so `/finish` can await exactly those.
+CLAIMS_TASK_PREFIX = "claims for "
 RECENT_SEGMENTS = 12
 RECENT_RUNS = 3
 # How many follow-up delays a pending run waits for an open stream before it is
@@ -366,7 +368,9 @@ class InterviewController:
         if extractor is None:
             return
         background.spawn(
-            self._app, extractor(self._app, interview_id, segment_id), f"claims for {segment_id}"
+            self._app,
+            extractor(self._app, interview_id, segment_id),
+            f"{CLAIMS_TASK_PREFIX}{segment_id}",
         )
 
     # --- runs -------------------------------------------------------------------

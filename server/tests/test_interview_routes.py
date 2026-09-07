@@ -5,39 +5,17 @@ means the whole path — cookie, snapshot, background task, run view — works.
 """
 
 import os
-import time
 
 from app.storage import repo
-from tests.conftest import ORIGIN, create_interview
-
-INITIAL_CHECK = "cross_company_isolation"
-CHANGED_CHECK = "revocation_next_request"
-
-
-def event_types(app, interview_id):
-    return [event["type"] for event in repo.list_events(app.state.db, interview_id, 0)]
-
-
-def save_files(client, interview_id, files):
-    response = client.put(
-        f"/api/interviews/{interview_id}/files", json={"files": files}, headers=ORIGIN
-    )
-    assert response.status_code == 200, response.text
-    return response.json()
-
-
-def wait_for_run(client, interview_id, run_id, timeout=10.0):
-    """Poll until the background task has finished the run."""
-    deadline = time.monotonic() + timeout
-    while True:
-        response = client.get(f"/api/interviews/{interview_id}/runs/{run_id}")
-        assert response.status_code == 200, response.text
-        body = response.json()
-        if body["status"] not in ("queued", "running"):
-            return body
-        if time.monotonic() > deadline:
-            raise AssertionError(f"run {run_id} was still {body['status']} after {timeout}s")
-        time.sleep(0.1)
+from tests.conftest import (
+    CHANGED_CHECK,
+    INITIAL_CHECK,
+    ORIGIN,
+    create_interview,
+    event_types,
+    save_files,
+    wait_for_run,
+)
 
 
 # --- the interview view ---------------------------------------------------
@@ -277,13 +255,6 @@ def test_a_run_of_another_interview_is_404(client, candidate, scenario):
 
 
 # --- finish and delete ----------------------------------------------------
-
-def test_finish_is_not_implemented_yet(client, candidate):
-    response = client.post(f"/api/interviews/{candidate['id']}/finish", headers=ORIGIN)
-
-    assert response.status_code == 501
-    assert response.json()["detail"] == "finish is implemented in a later task"
-
 
 def test_delete_removes_the_rows_and_the_snapshot_directory(client, app, candidate, scenario):
     save_files(client, candidate["id"], dict(scenario.editable_files))

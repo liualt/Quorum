@@ -1,6 +1,8 @@
 """Interview lifecycle: create, read, start, pause, finish, delete."""
 
+import asyncio
 import logging
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -8,10 +10,11 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from app import ids
+from app import background, cleanup, ids
+from app.evidence.findings import build_assessment
 from app.execution import runs as run_service
 from app.interview import prompts
-from app.interview.controller import segment_view
+from app.interview.controller import CLAIMS_TASK_PREFIX, segment_view
 from app.interview.state import ControllerState
 from app.routes.deps import (
     COOKIE_CANDIDATE,
@@ -24,7 +27,7 @@ from app.routes.deps import (
     set_capability_cookie,
 )
 from app.scenario import public_check
-from app.storage import repo, snapshots
+from app.storage import repo
 from app.storage.events import emit
 
 logger = logging.getLogger(__name__)
@@ -36,26 +39,16 @@ mutations = APIRouter(
 
 #: Everything `/start` records about the conversation the agent joins.
 AGORA_COLUMNS = ("agora_channel", "agora_agent_id", "agora_uid", "agora_agent_uid")
+#: The statuses `/finish` may take an interview out of.
+FINISHABLE_STATUSES = ("created", "live")
+#: How long `/finish` waits for a run in flight before assessing without it.
+FINISH_RUN_WAIT_SECONDS = 25.0
+FINISH_POLL_SECONDS = 0.5
 
 
 def initial_state_json() -> str:
     """The controller state a new interview starts from."""
     return ControllerState().to_json()
-
-
-async def delete_interview(app, interview_id: str) -> None:
-    """Remove every trace of an interview: its agent, its rows, its snapshots.
-
-    Task 8 relocates this to `app/cleanup.py`, where expiry reuses it.
-    """
-    row = repo.get_interview(app.state.db, interview_id)
-    voice = getattr(app.state, "voice", None)
-    if row is not None and row["agora_agent_id"] and voice is not None:
-        # Before the rows go, while the agent id is still readable. `stop_agent`
-        # never raises, so a deletion is never blocked by Agora.
-        await voice.stop_agent(row["agora_agent_id"])
-    repo.delete_interview_rows(app.state.db, interview_id)
-    snapshots.delete_interview_dir(app.state.settings.SNAPSHOT_DIR, interview_id)
 
 
 class CreateInterviewRequest(BaseModel):
@@ -270,15 +263,63 @@ async def set_paused(
 
 
 @mutations.post("/{interview_id}/finish")
-async def finish_interview(row=Depends(require_candidate)) -> dict:
-    raise HTTPException(501, "finish is implemented in a later task")
+async def finish_interview(
+    interview_id: str, request: Request, row=Depends(require_candidate)
+) -> dict:
+    """Stop the voice, let the work in flight settle, and produce the assessment.
+
+    The status moves to `finishing` under the interview's lock, so a double
+    click gets a 409 rather than a second assessment, and a finished interview
+    answers with the assessment it already has.
+    """
+    app = request.app
+    controller = app.state.controller
+    async with controller.interview_lock(interview_id):
+        current = repo.get_interview(app.state.db, interview_id) or row
+        if current["status"] == "finished":
+            return _finish_response(repo.latest_assessment(app.state.db, interview_id))
+        if current["status"] not in FINISHABLE_STATUSES:
+            raise HTTPException(409, "this interview is already finishing")
+        repo.update_interview(app.state.db, interview_id, status="finishing")
+
+    voice = getattr(app.state, "voice", None)
+    if voice is not None and current["agora_agent_id"]:
+        await voice.stop_agent(current["agora_agent_id"])
+    await _wait_for_active_run(app, interview_id)
+    # Every claim the record should hold is still being read from the last turns.
+    await asyncio.gather(*background.pending(app, CLAIMS_TASK_PREFIX), return_exceptions=True)
+
+    async with controller.interview_lock(interview_id):
+        state = controller.load_state(interview_id)
+        state.enter_stage("assessment")
+        controller.save_state(interview_id, state)
+        emit(app.state.db, app.state.bus, interview_id, "stage_changed", {"stage": "assessment"})
+
+    assessment = await build_assessment(app, interview_id)
+    repo.update_interview(app.state.db, interview_id, status="finished", finished_at=ids.now_iso())
+    emit(app.state.db, app.state.bus, interview_id, "interview_finished", {})
+    return _finish_response(assessment)
+
+
+def _finish_response(assessment) -> dict:
+    return {"assessment_id": assessment["id"], "status": assessment["status"]}
+
+
+async def _wait_for_active_run(app, interview_id: str) -> None:
+    """A run that started before `/finish` is evidence; give it a bounded chance to land."""
+    deadline = time.monotonic() + FINISH_RUN_WAIT_SECONDS
+    while repo.active_run(app.state.db, interview_id) is not None:
+        if time.monotonic() >= deadline:
+            logger.warning("finishing %s with a run still active", interview_id)
+            return
+        await asyncio.sleep(FINISH_POLL_SECONDS)
 
 
 @mutations.delete("/{interview_id}", status_code=204, response_class=Response)
 async def delete_interview_route(
     interview_id: str, request: Request, participant=Depends(require_participant)
 ) -> Response:
-    await delete_interview(request.app, interview_id)
+    await cleanup.delete_interview(request.app, interview_id)
     return Response(status_code=204)
 
 

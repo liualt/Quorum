@@ -339,6 +339,10 @@ def insert_finding(conn, *, id, interview_id, assessment_id, dimension, is_dimen
     return _fetch_one(conn, "findings", id)
 
 
+def get_finding(conn, id):
+    return _fetch_one(conn, "findings", id)
+
+
 def update_finding(conn, id, **fields):
     with _lock:
         _update_fields(conn, "findings", id, fields)

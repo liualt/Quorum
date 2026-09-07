@@ -7,13 +7,16 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import background
+from app import background, cleanup, ids
 from app.config import Settings, get_settings
+from app.evidence.claims import extract_and_store_claims
+from app.evidence.disputes import mark_findings_needing_review
+from app.evidence.links import link_run_to_claims
 from app.execution.executor import build_executor
 from app.interview.agora import build_voice
 from app.interview.controller import InterviewController
 from app.interview.llm_client import build_llm
-from app.routes import auth, events, files, interviews, llm, runs, turns
+from app.routes import assessment, auth, events, files, interviews, llm, runs, turns
 from app.scenario import load_scenario
 from app.storage import db, repo
 from app.storage.events import EventBus
@@ -44,9 +47,29 @@ async def lifespan(app: FastAPI):
     app.state.voice = build_voice(settings)
     app.state.controller = InterviewController(app)
 
+    # The evidence hooks earlier modules reach through `getattr`: the controller
+    # schedules claim extraction and hands completed runs to the linker, and the
+    # run service marks findings when a replay disagrees with its original.
+    app.state.claims_extractor = extract_and_store_claims
+    app.state.link_run = lambda interview_id, run_row: link_run_to_claims(
+        app.state.db, interview_id, run_row
+    )
+    app.state.mark_findings_needing_review = (
+        lambda interview_id, ref_type, ref_id, reason: mark_findings_needing_review(
+            app.state.db, app.state.bus, interview_id, ref_type, ref_id, reason
+        )
+    )
+
+    await cleanup.expire_interviews(app, ids.now_iso())
+    background.spawn_periodic(
+        app,
+        lambda: cleanup.expire_interviews(app, ids.now_iso()),
+        cleanup.EXPIRY_INTERVAL_SECONDS,
+        "expiry",
+    )
+
     yield
 
-    # task 8: evidence hooks + cleanup
     await background.cancel_all(app)
     connection.close()
 
@@ -76,6 +99,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(events.router)
     app.include_router(auth.mutations)
     app.include_router(turns.mutations)
+    app.include_router(assessment.router)
+    app.include_router(assessment.mutations)
     # The voice agent's endpoint: bearer-authenticated, outside /api and its guards.
     app.include_router(llm.router)
 

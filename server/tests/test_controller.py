@@ -17,10 +17,16 @@ from app.interview.controller import ENDED_TEXT, RECOVERY_TEXT, InterviewControl
 from app.interview.llm_client import LLMError
 from app.interview.state import ControllerState
 from app.storage import repo
-from tests.conftest import ORIGIN, create_interview, seed_interview, seed_snapshot
-
-INITIAL_CHECK = "cross_company_isolation"
-CHANGED_CHECK = "revocation_next_request"
+from tests.conftest import (
+    CHANGED_CHECK,
+    INITIAL_CHECK,
+    ORIGIN,
+    completed_run,
+    create_interview,
+    drain,
+    event_types,
+    seed_interview,
+)
 
 
 # --- helpers ---------------------------------------------------------------------
@@ -42,58 +48,8 @@ def seed_state(app, state: ControllerState):
     )
 
 
-def completed_run(app, interview_id: str, check_ids: list[str], passed: dict | None = None,
-                  *, status: str = "completed", replay_of: str | None = None):
-    """A terminal run row, results included, without going through the executor."""
-    snapshot = repo.latest_snapshot(app.state.db, interview_id) or seed_snapshot(
-        app, interview_id, dict(app.state.scenario.editable_files)
-    )
-    run_id = ids.new_id("run")
-    repo.insert_run(
-        app.state.db,
-        id=run_id,
-        interview_id=interview_id,
-        snapshot_id=snapshot["id"],
-        fixture_version="v1",
-        check_version="v1",
-        check_ids_json=json.dumps(check_ids),
-        input_hash="hash",
-        status="queued",
-        executor="local",
-        replay_of=replay_of,
-    )
-    results = None
-    if status == "completed":
-        results = json.dumps(
-            [
-                {"check_id": check_id, "passed": bool((passed or {}).get(check_id, False)),
-                 "steps": [], "search_calls": None, "max_search_calls": None,
-                 "efficiency_ok": None, "error": None}
-                for check_id in check_ids
-            ]
-        )
-    return repo.update_run(
-        app.state.db,
-        run_id,
-        status=status,
-        results_json=results,
-        started_at=ids.now_iso(),
-        finished_at=ids.now_iso(),
-    )
-
-
 def segments(app, interview_id: str) -> list:
     return repo.list_segments(app.state.db, interview_id)
-
-
-def event_types(app, interview_id: str) -> list[str]:
-    return [event["type"] for event in repo.list_events(app.state.db, interview_id, 0)]
-
-
-async def drain(app):
-    tasks = list(getattr(app.state, "background_tasks", ()))
-    if tasks:
-        await asyncio.gather(*tasks)
 
 
 async def turn(app, interview_id: str, text: str) -> dict:

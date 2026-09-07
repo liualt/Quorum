@@ -15,10 +15,14 @@ from app.execution.executor import ExecResult
 from app.execution.runs import EXECUTION_FAILED_MESSAGE, RunError, allowed_check_ids, run_view
 from app.storage import repo, snapshots
 from app.storage.snapshots import SnapshotError
-from tests.conftest import seed_interview, seed_snapshot
-
-INITIAL_CHECK = "cross_company_isolation"
-CHANGED_CHECK = "revocation_next_request"
+from tests.conftest import (
+    CHANGED_CHECK,
+    INITIAL_CHECK,
+    drain,
+    event_types,
+    seed_interview,
+    seed_snapshot,
+)
 
 
 class StubExecutor:
@@ -105,16 +109,6 @@ def seeded(live_app, scenario):
     snapshot = seed_snapshot(live_app, interview["id"], dict(scenario.editable_files))
     live_app.state.executor = StubExecutor(runner_output(scenario, [INITIAL_CHECK, CHANGED_CHECK]))
     return interview, snapshot
-
-
-async def drain(app):
-    tasks = list(getattr(app.state, "background_tasks", ()))
-    if tasks:
-        await asyncio.gather(*tasks)
-
-
-def event_types(app, interview_id):
-    return [event["type"] for event in repo.list_events(app.state.db, interview_id, 0)]
 
 
 # --- start_run ------------------------------------------------------------

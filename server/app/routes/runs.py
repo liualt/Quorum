@@ -20,6 +20,10 @@ class StartRunRequest(BaseModel):
     idempotency_key: str | None = None
 
 
+class StartReplayRequest(BaseModel):
+    run_id: str
+
+
 @mutations.post("/{interview_id}/runs", status_code=202)
 async def start_run(
     interview_id: str,
@@ -31,6 +35,21 @@ async def start_run(
         created = await run_service.start_run(
             request.app, interview_id, body.snapshot_id, body.check_ids, body.idempotency_key
         )
+    except RunError as error:
+        raise HTTPException(error.status_code, error.detail) from error
+    return run_view(created)
+
+
+@mutations.post("/{interview_id}/replays", status_code=202)
+async def start_replay(
+    interview_id: str,
+    body: StartReplayRequest,
+    request: Request,
+    participant=Depends(require_participant),
+) -> dict:
+    """Rerun a recorded run's own inputs beside it; the original is never touched."""
+    try:
+        created = await run_service.start_replay(request.app, interview_id, body.run_id)
     except RunError as error:
         raise HTTPException(error.status_code, error.detail) from error
     return run_view(created)
