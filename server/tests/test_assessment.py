@@ -483,6 +483,38 @@ async def record(live_app):
     }
 
 
+async def test_a_finding_citing_a_claim_carries_the_segment_it_was_read_from(live_app, record):
+    """A claim is the model's reading; the drawer has to show the words behind it."""
+    from app.evidence.findings import assessment_view
+
+    claim_id = next(ref["id"] for ref in record["refs"] if ref["type"] == "claim")
+    payload = record["payload"](
+        findings=[record["entry"]("understanding_problem", supporting_refs=[
+            {"type": "claim", "id": claim_id}
+        ])],
+    )
+    from app.evidence import findings as findings_module
+
+    assessment = repo.insert_assessment(
+        record["conn"], id=ids.new_id("asm"), interview_id=record["interview_id"],
+        status="complete", rubric_version="v1", prompt_version="v1", model_id="scripted",
+        summary="A summary of the interview.",
+    )
+    findings_module._store_findings(
+        record["conn"], record["interview_id"], assessment["id"],
+        findings_module._entries_from_payload(payload),
+    )
+
+    view = assessment_view(record["conn"], record["interview_id"], "reviewer")
+
+    segment_id = record["conn"].execute(
+        "SELECT segment_id FROM claims WHERE id = ?", (claim_id,)
+    ).fetchone()[0]
+    finding = view["findings"][0]
+    assert finding["supporting_refs"] == [{"type": "claim", "id": claim_id}]
+    assert segment_id in view["evidence"]["segments"]
+
+
 def errors_for(record, payload):
     return validate_assessment_payload(record["conn"], record["interview_id"], payload)
 
@@ -571,6 +603,10 @@ async def test_a_short_explanation_is_an_error(record):
         ("uncertainty", "They spoke honestly about the untested path, it seems."),
         ("follow_up", "Ask whether they were dishonest."),
         ("follow_up", "Ask whether the ranking of fixes was theirs."),
+        # Inflections the first pass missed; each is the same promise broken.
+        ("summary", "The rankings put them mid-pack."),
+        ("explanation", "Their honesty was not in question at any point."),
+        ("title", "A careful scorer of tradeoffs"),
     ],
 )
 async def test_forbidden_words_are_errors_wherever_they_appear(record, field, text):

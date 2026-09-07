@@ -8,6 +8,7 @@ the assertions below are about what the controller decided, not about prose.
 
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -660,3 +661,84 @@ def test_post_turns_after_the_interview_ended_only_says_goodbye(client, app, can
     assert response.status_code == 200
     assert response.json()["text"] == ENDED_TEXT
     assert response.json()["segment_id"] is None
+
+
+# --- the session cap -------------------------------------------------------------
+
+
+def start_minutes_ago(app, interview_id: str, minutes: float):
+    """Move `started_at` back, which is the only clock `_elapsed_minutes` reads."""
+    started = datetime.now(UTC) - timedelta(minutes=minutes)
+    return repo.update_interview(
+        app.state.db,
+        interview_id,
+        status="live",
+        started_at=started.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    )
+
+
+async def test_the_first_turn_past_the_session_cap_is_a_wrap_up(live_app):
+    """PRD section 4: the cap is the server's, not the browser timer's."""
+    row = seed_interview(live_app)
+    start_minutes_ago(live_app, row["id"], live_app.state.settings.SESSION_CAP_MINUTES + 1)
+
+    result = await turn(live_app, row["id"], "One more thought before I finish.")
+
+    assert result["text"] != ENDED_TEXT
+    assert "wrap_up" in result["text"]  # the scripted double names its instruction
+    assert ControllerState.from_json(
+        repo.get_interview(live_app.state.db, row["id"])["state_json"]
+    ).cap_wrap_up_sent
+
+
+async def test_every_turn_after_the_wrap_up_is_refused_with_no_role_segment(live_app):
+    row = seed_interview(live_app)
+    start_minutes_ago(live_app, row["id"], live_app.state.settings.SESSION_CAP_MINUTES + 1)
+    await turn(live_app, row["id"], "One more thought.")
+    before = len(segments(live_app, row["id"]))
+
+    result = await turn(live_app, row["id"], "And another.")
+
+    assert result["text"] == ENDED_TEXT
+    assert result["segment_id"] is None
+    # The candidate's own line is still recorded; the panel said nothing.
+    speakers = [seg["speaker"] for seg in segments(live_app, row["id"])[before:]]
+    assert speakers == ["candidate"]
+
+
+async def test_paused_time_does_not_count_towards_the_cap(live_app):
+    """A candidate who paused for ten minutes has not used ten minutes."""
+    row = seed_interview(live_app)
+    cap = live_app.state.settings.SESSION_CAP_MINUTES
+    start_minutes_ago(live_app, row["id"], cap + 5)
+    repo.update_interview(live_app.state.db, row["id"], paused_ms=10 * 60 * 1000)
+
+    result = await turn(live_app, row["id"], "Still going.")
+
+    assert result["text"] != ENDED_TEXT
+    assert not ControllerState.from_json(
+        repo.get_interview(live_app.state.db, row["id"])["state_json"]
+    ).cap_wrap_up_sent
+
+
+async def test_a_proactive_follow_up_is_dropped_when_a_turn_started_in_between(live_app):
+    """PRD section 9: a run never cuts off a response already being spoken."""
+    row = seed_interview(live_app)
+    make_live(live_app, row["id"])
+    ctrl = controller(live_app)
+    # A candidate turn is mid-stream: the follow-up's own check passed a moment
+    # ago and it is now asking `_plan` for a turn of its own.
+    state = ControllerState.from_json(repo.get_interview(live_app.state.db, row["id"])["state_json"])
+    ctrl._streaming[row["id"]] = state.generation + 1
+    before = ControllerState.from_json(
+        repo.get_interview(live_app.state.db, row["id"])["state_json"]
+    ).generation
+
+    result = await ctrl.run_turn_collect(row["id"], "", source="run")
+
+    assert result["text"] == ""  # not ENDED_TEXT: nothing was said at all
+    assert result["segment_id"] is None
+    after = ControllerState.from_json(
+        repo.get_interview(live_app.state.db, row["id"])["state_json"]
+    ).generation
+    assert after == before  # the streaming turn was not interrupted

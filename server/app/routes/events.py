@@ -17,6 +17,10 @@ from app.storage import repo
 router = APIRouter(prefix="/api/interviews", tags=["events"])
 
 PING_SECONDS = 15
+#: `no-transform` tells every proxy between here and the browser (the Next.js
+#: rewrite included) not to compress the stream: a compressor holds each small
+#: frame back until its buffer fills. `X-Accel-Buffering` says the same to nginx.
+STREAM_HEADERS = {"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"}
 
 
 @router.get("/{interview_id}/events")
@@ -45,7 +49,7 @@ async def stream_events(
         finally:
             bus.unsubscribe(interview_id, queue)
 
-    return EventSourceResponse(publish(), ping=PING_SECONDS)
+    return EventSourceResponse(publish(), ping=PING_SECONDS, headers=STREAM_HEADERS)
 
 
 def _message(event: dict) -> dict:

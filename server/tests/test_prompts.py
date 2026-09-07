@@ -174,6 +174,13 @@ def test_spoken_prompt_names_the_pending_run_and_its_failed_checks():
     assert "repeat_search_efficiency" in text
 
 
+def test_run_digest_says_the_outcome_a_reader_cannot_infer_from_empty_results():
+    assert prompts.run_digest(RUN)["outcome"] == "completed: 1 of 3 checks passed"
+    timed_out = prompts.run_digest(dict(RUN, status="timeout", results=[]))
+    assert timed_out["outcome"] == "did not complete (timeout); no results"
+    assert timed_out["failed_checks"] == []
+
+
 def test_spoken_prompt_carries_the_state_stage_role_and_instruction_blocks():
     text = system_text(prompts.spoken_turn_messages(turn_context()))
 

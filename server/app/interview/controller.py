@@ -34,6 +34,8 @@ from app.storage.events import emit
 logger = logging.getLogger(__name__)
 
 ENDED_TEXT = "The interview has ended. Thank you."
+#: Given to the panel on the one turn that crosses `SESSION_CAP_MINUTES`.
+CAP_NOTE = "The session time limit has been reached. Close the interview now."
 # Spoken when the model fails. Never a made-up question: the candidate is asked to repeat.
 RECOVERY_TEXT = "Give me a moment, I lost my train of thought. Could you say that again?"
 
@@ -41,6 +43,15 @@ RECOVERY_TEXT = "Give me a moment, I lost my train of thought. Could you say tha
 ACCEPTING_TURNS = ("created", "live")
 #: How claim-extraction tasks are named, so `/finish` can await exactly those.
 CLAIMS_TASK_PREFIX = "claims for "
+
+
+def claims_task_prefix(interview_id: str) -> str:
+    """Name the claim tasks of one interview apart from every other interview's.
+
+    `_finish` waits on these before it reads the record, and waiting on another
+    interview's extraction would hold a finish open for work it does not need.
+    """
+    return f"{CLAIMS_TASK_PREFIX}{interview_id} "
 RECENT_SEGMENTS = 12
 RECENT_RUNS = 3
 # How many follow-up delays a pending run waits for an open stream before it is
@@ -65,6 +76,41 @@ def segment_view(row) -> dict:
     return {column: row[column] for column in SEGMENT_VIEW_COLUMNS}
 
 
+#: Record ids the panel must never say out loud (PRD section 9: ids live in the
+#: record, not in the words). Every prefix `app.ids` mints, and its 16 hex digits.
+ID_PATTERN = re.compile(r"\b(?:seg|run|clm|snap|itv|dsp|fnd|asm)_[0-9a-f]{16}\b")
+#: The longest an id can be, so a scrubber holding back this much of its buffer
+#: can never emit the first half of one it has not finished reading.
+_ID_MAX_LEN = 21
+
+
+def scrub_ids(text: str) -> str:
+    """Take the record ids out of something about to be spoken."""
+    return re.sub(r"  +", " ", ID_PATTERN.sub("", text))
+
+
+class IdScrubber:
+    """`scrub_ids` over a stream, where an id can straddle two chunks.
+
+    The tail of the buffer is held back until enough has arrived to tell an id
+    from a word that merely starts like one.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = ""
+
+    def feed(self, chunk: str) -> str:
+        self._buffer += chunk
+        if len(self._buffer) <= _ID_MAX_LEN:
+            return ""
+        emit, self._buffer = self._buffer[:-_ID_MAX_LEN], self._buffer[-_ID_MAX_LEN:]
+        return scrub_ids(emit)
+
+    def flush(self) -> str:
+        emit, self._buffer = self._buffer, ""
+        return scrub_ids(emit)
+
+
 @dataclass
 class TurnOutcome:
     """What a collected turn reports back; filled in as the turn runs."""
@@ -72,6 +118,9 @@ class TurnOutcome:
     segment_id: str | None = None
     role: str = "technical"
     stage: str = "briefing"
+    #: True when the turn was dropped without a word being said, so the caller
+    #: knows the empty text is a deliberate silence and not an ended interview.
+    abandoned: bool = False
 
 
 @dataclass
@@ -192,6 +241,8 @@ class InterviewController:
         async with self.interview_lock(interview_id):
             plan = self._plan(interview_id, user_text.strip(), source, outcome)
         if plan is None:
+            if outcome.abandoned:
+                return
             yield ENDED_TEXT
             return
 
@@ -200,13 +251,20 @@ class InterviewController:
         self._streaming[interview_id] = plan.generation
         try:
             try:
+                scrub = IdScrubber()
                 async with aclosing(self._app.state.llm.stream_text(plan.messages)) as stream:
                     async for chunk in stream:
                         if self.current_generation(interview_id) != plan.generation:
                             status = "interrupted"
                             break
-                        pieces.append(chunk)
-                        yield chunk
+                        spoken = scrub.feed(chunk)
+                        if spoken:
+                            pieces.append(spoken)
+                            yield spoken
+                tail = scrub.flush()
+                if tail:
+                    pieces.append(tail)
+                    yield tail
             except LLMError as error:
                 logger.warning("turn %s of %s: %s", plan.generation, interview_id, error)
                 status = "pending"
@@ -243,10 +301,21 @@ class InterviewController:
         candidate_segment_id = None
         if user_text:
             candidate_segment_id = self._record_candidate(interview_id, state, user_text)
+        if source == "run" and interview_id in self._streaming:
+            # A candidate turn started between the follow-up's last check and
+            # this lock. Cutting it off to raise a run is exactly what PRD
+            # section 9 forbids, and bumping the generation would do that, so
+            # the follow-up is dropped and the run stays pending for the next.
+            outcome.abandoned = True
+            return None
+
         facts = self.facts(interview_id)
         if user_text:
             self._advance_stage(interview_id, state, facts)
         role, instruction = self._choose_role(interview_id, state, facts, source)
+        instruction = self._apply_session_cap(interview_id, state, facts, instruction, outcome)
+        if instruction is None:
+            return None
         messages = self._build_messages(interview_id, state, role, instruction, recent, user_text)
         self.save_state(interview_id, state)
 
@@ -261,6 +330,30 @@ class InterviewController:
             candidate_segment_id=candidate_segment_id,
             pending_run_ids=list(state.pending_run_ids),
         )
+
+    def _apply_session_cap(
+        self,
+        interview_id: str,
+        state: ControllerState,
+        facts: Facts,
+        instruction: TurnInstruction,
+        outcome: TurnOutcome,
+    ) -> TurnInstruction | None:
+        """Stop the interview at the cap, server-side (PRD section 4).
+
+        The browser's timer is a display; nothing stops a candidate reloading
+        past it. The first turn over the cap is a wrap-up so the panel closes
+        rather than cutting off mid-sentence, and every turn after it gets
+        `ENDED_TEXT` with no model call and no role segment.
+        """
+        cap = self._app.state.settings.SESSION_CAP_MINUTES
+        if cap <= 0 or facts.elapsed_minutes < cap:
+            return instruction
+        if state.cap_wrap_up_sent:
+            return None
+        state.cap_wrap_up_sent = True
+        self.save_state(interview_id, state)
+        return TurnInstruction("wrap_up", note=CAP_NOTE)
 
     def _record_candidate(self, interview_id: str, state: ControllerState, text: str) -> str:
         row = self._insert_segment(
@@ -370,7 +463,7 @@ class InterviewController:
         background.spawn(
             self._app,
             extractor(self._app, interview_id, segment_id),
-            f"{CLAIMS_TASK_PREFIX}{segment_id}",
+            f"{claims_task_prefix(interview_id)}{segment_id}",
         )
 
     # --- runs -------------------------------------------------------------------

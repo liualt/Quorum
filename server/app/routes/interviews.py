@@ -14,13 +14,14 @@ from app import background, cleanup, ids
 from app.evidence.findings import build_assessment
 from app.execution import runs as run_service
 from app.interview import prompts
-from app.interview.controller import CLAIMS_TASK_PREFIX, segment_view
+from app.interview.controller import claims_task_prefix, segment_view
 from app.interview.state import ControllerState
 from app.routes.deps import (
     COOKIE_CANDIDATE,
     hash_token,
     llm_token,
     new_token,
+    require_access_key,
     require_candidate,
     require_participant,
     require_same_origin,
@@ -59,11 +60,18 @@ class CreateInterviewRequest(BaseModel):
     consent: Literal[True]
 
 
+class StartInterviewRequest(BaseModel):
+    #: False when the candidate chose text: the interview goes live without a
+    #: voice agent, however the server is configured (PRD section 15: a demo
+    #: must not start paid sessions nobody joins).
+    voice: bool = True
+
+
 class SetPausedRequest(BaseModel):
     paused: bool
 
 
-@mutations.post("", status_code=201)
+@mutations.post("", status_code=201, dependencies=[Depends(require_access_key)])
 async def create_interview(
     body: CreateInterviewRequest, request: Request, response: Response
 ) -> dict:
@@ -113,9 +121,13 @@ async def get_interview(request: Request, participant=Depends(require_participan
 
 @mutations.post("/{interview_id}/start")
 async def start_interview(
-    interview_id: str, request: Request, row=Depends(require_candidate)
+    interview_id: str,
+    request: Request,
+    row=Depends(require_candidate),
+    body: StartInterviewRequest | None = None,
 ) -> dict:
     app = request.app
+    with_voice = body.voice if body is not None else True
     # A double click, or a reload landing while the first start is still in
     # flight, must not put two agents in one channel or two greetings in the
     # transcript. Whether an agent already exists is read and acted on here.
@@ -123,7 +135,9 @@ async def start_interview(
         # The row the dependency read can predate a start that just finished.
         current = repo.get_interview(app.state.db, interview_id) or row
         greeting = prompts.greeting_text(current["display_name"])
-        join, voice_status, agora = await _join_voice(app, interview_id, current, greeting)
+        join, voice_status, agora = await _join_voice(
+            app, interview_id, current, greeting, with_voice=with_voice
+        )
 
         repo.update_interview(
             app.state.db,
@@ -139,7 +153,9 @@ async def start_interview(
         return {"voice": join}
 
 
-async def _join_voice(app, interview_id: str, row, greeting: str) -> tuple[dict, str, dict]:
+async def _join_voice(
+    app, interview_id: str, row, greeting: str, *, with_voice: bool
+) -> tuple[dict, str, dict]:
     """Put an agent in the interview's channel, and say what to record about it.
 
     Voice is the medium, not the interview: every failure here — a malformed
@@ -151,6 +167,13 @@ async def _join_voice(app, interview_id: str, row, greeting: str) -> tuple[dict,
         return {"enabled": False}, "off", {}
 
     stored = row["agora_agent_id"]
+    if not with_voice:
+        # Text was chosen: no paid agent is started, and one a previous join
+        # left in the channel is taken down rather than billed until it idles.
+        if stored:
+            await voice.stop_agent(stored)
+        return {"enabled": False}, "off", dict.fromkeys(AGORA_COLUMNS) if stored else {}
+
     # An id on the row is not an agent in the channel: one left alone hangs up.
     rejoining = bool(stored) and await voice.agent_is_live(stored)
     try:
@@ -304,7 +327,9 @@ async def _finish(app, interview_id: str, current):
     await _stop_voice(app, current)
     await _wait_for_active_run(app, interview_id)
     # Every claim the record should hold is still being read from the last turns.
-    await asyncio.gather(*background.pending(app, CLAIMS_TASK_PREFIX), return_exceptions=True)
+    await asyncio.gather(
+        *background.pending(app, claims_task_prefix(interview_id)), return_exceptions=True
+    )
 
     async with controller.interview_lock(interview_id):
         state = controller.load_state(interview_id)
@@ -321,6 +346,8 @@ def _mark_finished(app, interview_id: str, current) -> None:
         interview_id,
         status="finished",
         finished_at=current["finished_at"] or ids.now_iso(),
+        # Retention is promised from the end of the interview, not its creation.
+        expires_at=_expiry(app.state.settings.RETENTION_DAYS),
     )
     emit(app.state.db, app.state.bus, interview_id, "interview_finished", {})
 
@@ -376,6 +403,10 @@ def interview_view(app, row, me: str) -> dict:
         "stage": row["stage"],
         "active_role": row["active_role"],
         "paused": bool(row["paused"]),
+        # Paused time banked so far, and when the current pause began: enough
+        # for a reloaded page to show the same clock the server keeps.
+        "paused_ms": row["paused_ms"] or 0,
+        "paused_at": row["paused_at"] if row["paused"] else None,
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],

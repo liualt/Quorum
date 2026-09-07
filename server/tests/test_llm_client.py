@@ -243,6 +243,15 @@ async def test_scripted_spoken_turn_cites_the_pending_run_and_its_failed_checks(
     assert "repeat_search_efficiency" in text
 
 
+async def test_scripted_spoken_turn_does_not_narrate_a_pass_for_a_run_that_timed_out():
+    """A timed-out run has no results, so "it passed every check" would be a lie."""
+    timed_out = dict(RUN, status="timeout", results=[])
+    text = await spoken(pending_runs=[timed_out])
+
+    assert "did not complete" in text
+    assert "passed" not in text
+
+
 async def test_scripted_spoken_turn_says_a_pending_run_passed_everything():
     passing = dict(RUN, results=[{"check_id": "access_filtering", "passed": True, "steps": [],
                                  "search_calls": None, "max_search_calls": None,

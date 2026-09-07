@@ -289,6 +289,15 @@ def _evidence(conn, interview_id: str, findings: list[dict], links: list[dict]) 
     for link in links:
         wanted.add((link["source_type"], link["source_id"]))
         wanted.add((link["target_type"], link["target_id"]))
+    # A claim is a reading of something the candidate said; the drawer shows the
+    # words it was read from, so the segment it came from travels with it.
+    for ref_type, ref_id in list(wanted):
+        if ref_type != "claim":
+            continue
+        claim = repo.get_claim(conn, ref_id)
+        if claim is not None and claim["interview_id"] == interview_id:
+            wanted.add(("segment", claim["segment_id"]))
+
     cited_runs = {ref_id for ref_type, ref_id in wanted if ref_type == "run"}
     for run in repo.list_runs(conn, interview_id):
         if run["replay_of"] in cited_runs:

@@ -96,7 +96,7 @@ export function useVoiceBridge(
     setJoin(null);
     setNote(null);
     try {
-      const { voice } = await startInterview(interviewId);
+      const { voice } = await startInterview(interviewId, { voice: true });
       if (voice.enabled) {
         setJoin(voice);
         setStatus("connecting");

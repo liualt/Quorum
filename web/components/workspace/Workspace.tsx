@@ -245,7 +245,7 @@ export function Workspace({ id }: { id: string }) {
       setPhase("starting");
       setStartError(null);
       try {
-        const { voice: join } = await startInterview(id);
+        const { voice: join } = await startInterview(id, { voice: withVoice });
         applyJoin(join, withVoice);
         // The server set `started_at`; the timer needs it.
         setInterview(await getInterview(id));

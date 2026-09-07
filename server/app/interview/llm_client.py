@@ -203,6 +203,10 @@ def _instruction_kind(system: str) -> str:
 
 
 def _run_sentence(digest: dict) -> str:
+    if digest.get("status") != "completed":
+        # Narrating a pass for a run that never finished would put a claim in
+        # the transcript that no result supports.
+        return "I looked at your latest run, and it did not complete, so there is nothing to read yet."
     failed = digest.get("failed_checks") or []
     if failed:
         return f"I looked at your latest run, and it failed {', '.join(failed)}."

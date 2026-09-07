@@ -155,8 +155,9 @@ class AgoraVoiceService:
         self._settings = settings
         self._client = client if client is not None else _build_client(settings)
         self._session_factory = session_factory
-        # Only this process can make an agent it started speak; a restart leaves
-        # the agent running and reachable for `stop_agent` and nothing else.
+        # The sessions this process started. An agent started before a restart
+        # has no session here, but Agora still knows its id, so every call falls
+        # back to the REST client (`client.agents.*`) for one of those.
         self._sessions: dict[str, Any] = {}
 
     def make_join(
@@ -246,9 +247,7 @@ class AgoraVoiceService:
             if session is not None:
                 await session.stop()
             else:
-                # Started before a restart: no session to stop, but Agora still
-                # knows the id.
-                await self._client.stop_agent(agent_id)
+                await self._client.agents.stop(self._settings.AGORA_APP_ID, agent_id)
         except Exception:
             # Nothing downstream can act on this, and an agent nobody stopped
             # hangs up on its own after `idle_timeout`.
@@ -261,26 +260,29 @@ class AgoraVoiceService:
         raising over: a line the candidate did not hear is not a lost interview.
         """
         session = self._sessions.get(agent_id)
-        if session is None:
-            self._not_held(agent_id, "speak")
-            return
+        priority = "INTERRUPT" if interrupt else "APPEND"
         try:
-            await session.say(
-                text,
-                priority="INTERRUPT" if interrupt else "APPEND",
-                interruptable=True,
-            )
+            if session is not None:
+                await session.say(text, priority=priority, interruptable=True)
+            else:
+                await self._client.agents.speak(
+                    self._settings.AGORA_APP_ID,
+                    agent_id,
+                    text=text,
+                    priority=priority,
+                    interruptable=True,
+                )
         except Exception as failure:
             self._forget(agent_id, "speak", failure)
 
     async def interrupt(self, agent_id: str) -> None:
         """Stop the agent mid-sentence, as a person talking over it would."""
         session = self._sessions.get(agent_id)
-        if session is None:
-            self._not_held(agent_id, "interrupt")
-            return
         try:
-            await session.interrupt()
+            if session is not None:
+                await session.interrupt()
+            else:
+                await self._client.agents.interrupt(self._settings.AGORA_APP_ID, agent_id)
         except Exception as failure:
             self._forget(agent_id, "interrupt", failure)
 
@@ -369,18 +371,14 @@ class AgoraVoiceService:
         )
         return self._session_factory(agent, join)
 
-    def _not_held(self, agent_id: str, what: str) -> None:
-        logger.warning(
-            "cannot %s: voice agent %s is not held by this process", what, agent_id
-        )
-
     def _forget(self, agent_id: str, what: str, failure: Exception) -> None:
         """Stop holding a session that has stopped answering.
 
         An agent that hit Agora's idle timeout is gone, and the next call would
-        raise the same way. Dropping it turns every call after this one back
-        into the quiet no-op an unheld agent gets. The message stays out of the
-        log: an SDK error can quote the request it failed on, bearer and all.
+        raise the same way. Dropping the session sends every later call through
+        the REST client, which fails the same quiet way. The message stays out
+        of the log: an SDK error can quote the request it failed on, bearer and
+        all.
         """
         self._sessions.pop(agent_id, None)
         logger.warning(

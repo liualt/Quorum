@@ -38,6 +38,8 @@ class ControllerState:
     last_role_segment_id: str | None = None
     last_clarity: str = "clear"
     contradiction_note: str | None = None
+    # Set once the session cap has been announced; every later turn is refused.
+    cap_wrap_up_sent: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))

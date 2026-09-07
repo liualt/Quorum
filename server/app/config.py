@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     EXECUTOR: str = "e2b"
 
     SESSION_SECRET: str = ""
+    # When set, `POST /api/interviews` needs it in `X-Quorum-Access-Key`.
+    DEMO_ACCESS_KEY: str = ""
 
     DATABASE_PATH: str = "./data/quorum.db"
     SNAPSHOT_DIR: str = "./data/snapshots"

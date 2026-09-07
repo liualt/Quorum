@@ -7,6 +7,7 @@ to the network.
 """
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -76,32 +77,47 @@ class FakeSession:
 
 
 class FakeAgents:
-    """The `client.agents` namespace, with one canned answer about one agent."""
+    """The `client.agents` namespace of `AsyncAgora`, in the SDK's own shape.
+
+    `test_the_fake_client_has_the_sdk_shape` pins these names and parameters
+    to the installed SDK, so a call the SDK does not have cannot pass here.
+    """
 
     def __init__(self, *, status: str = "RUNNING", fails: bool = False):
         self.status = status
         self.fails = fails
         self.asked: list[str] = []
+        self.stopped: list[tuple[str, str]] = []
+        self.spoken: list[tuple] = []
+        self.interrupted: list[tuple[str, str]] = []
+
+    def _maybe_fail(self) -> None:
+        if self.fails:
+            raise RuntimeError("agora is unreachable")
 
     async def get(self, appid: str, agent_id: str):
         self.asked.append(agent_id)
-        if self.fails:
-            raise RuntimeError("agora is unreachable")
+        self._maybe_fail()
         return SimpleNamespace(agent_id=agent_id, status=self.status)
+
+    async def stop(self, appid: str, agent_id: str) -> None:
+        self.stopped.append((appid, agent_id))
+        self._maybe_fail()
+
+    async def speak(self, appid: str, agent_id: str, *, text, priority=None, interruptable=None):
+        self.spoken.append((appid, agent_id, text, priority, interruptable))
+        self._maybe_fail()
+
+    async def interrupt(self, appid: str, agent_id: str):
+        self.interrupted.append((appid, agent_id))
+        self._maybe_fail()
 
 
 class FakeClient:
-    """Stands in for `AsyncAgora`; records the agents it was asked to stop."""
+    """Stands in for `AsyncAgora`: the `agents` namespace is all the service uses."""
 
-    def __init__(self, *, fails: bool = False, status: str = "RUNNING", blind: bool = False):
-        self.fails = fails
-        self.stopped: list[str] = []
-        self.agents = FakeAgents(status=status, fails=blind)
-
-    async def stop_agent(self, agent_id: str) -> None:
-        self.stopped.append(agent_id)
-        if self.fails:
-            raise RuntimeError("agora is unreachable")
+    def __init__(self, *, fails: bool = False, status: str = "RUNNING"):
+        self.agents = FakeAgents(status=status, fails=fails)
 
 
 def fake_voice(session: FakeSession | None = None, client=None) -> AgoraVoiceService:
@@ -278,7 +294,8 @@ async def test_interrupt_stops_the_agent_mid_sentence():
 async def test_a_session_that_stops_answering_is_dropped_not_raised(caplog):
     """After Agora's idle timeout the session raises; the controller says inline."""
     session = FakeSession()
-    voice = fake_voice(session)
+    client = FakeClient()
+    voice = fake_voice(session, client=client)
     agent_id = await voice.start_agent(voice.make_join("itv_1"), **start_kwargs())
     session.fails = True
 
@@ -286,22 +303,51 @@ async def test_a_session_that_stops_answering_is_dropped_not_raised(caplog):
         await voice.say(agent_id, "Still there?")
         await voice.interrupt(agent_id)
 
-    # The first call dropped the session; the second found nothing to call.
+    # The first call dropped the session; the second went to Agora directly.
     assert session.calls[1:] == [("say", "Still there?", "APPEND", True)]
-    assert [record.levelname for record in caplog.records] == ["WARNING", "WARNING"]
+    assert [record.levelname for record in caplog.records] == ["WARNING"]
     assert "no longer live" in caplog.records[0].message
-    assert "not held by this process" in caplog.records[1].message
+    assert client.agents.interrupted == [(APP_ID, agent_id)]
 
 
-async def test_speaking_to_an_unknown_agent_is_a_warning_not_a_failure(caplog):
-    voice = fake_voice()
+async def test_an_agent_from_a_previous_process_is_spoken_to_through_the_rest_client():
+    """After a restart there is no session, but Agora still takes the request."""
+    client = FakeClient()
+    voice = fake_voice(client=client)
+
+    await voice.say("agent-from-a-previous-process", "Hello?")
+    await voice.say("agent-from-a-previous-process", "Hold on.", interrupt=True)
+    await voice.interrupt("agent-from-a-previous-process")
+
+    assert client.agents.spoken == [
+        (APP_ID, "agent-from-a-previous-process", "Hello?", "APPEND", True),
+        (APP_ID, "agent-from-a-previous-process", "Hold on.", "INTERRUPT", True),
+    ]
+    assert client.agents.interrupted == [(APP_ID, "agent-from-a-previous-process")]
+
+
+async def test_a_rest_refusal_for_an_unheld_agent_is_a_warning_not_a_failure(caplog):
+    client = FakeClient(fails=True)
+    voice = fake_voice(client=client)
 
     with caplog.at_level("WARNING"):
         await voice.say("agent-from-a-previous-process", "Hello?")
         await voice.interrupt("agent-from-a-previous-process")
 
-    assert len(caplog.records) == 2
+    assert [record.levelname for record in caplog.records] == ["WARNING", "WARNING"]
     assert "agent-from-a-previous-process" in caplog.text
+
+
+def test_the_fake_client_has_the_sdk_shape():
+    """Every method the fake offers exists on `AsyncAgora().agents` with the same
+    parameters, so the fake cannot mask a call the SDK does not have."""
+    from agora_agent.agents.client import AsyncAgentsClient
+
+    for name in ("get", "stop", "speak", "interrupt"):
+        real = inspect.signature(getattr(AsyncAgentsClient, name))
+        fake = inspect.signature(getattr(FakeAgents, name))
+        real_names = [p for p in real.parameters if p not in ("self", "request_options")]
+        assert list(fake.parameters)[1:] == real_names, name
 
 
 def test_every_attempt_asks_for_its_own_agent_name():
@@ -345,7 +391,7 @@ async def test_agent_is_live_follows_the_status_agora_reports(status, live):
 async def test_an_agent_agora_will_not_talk_about_is_not_live(caplog):
     """Unreachable, unknown, refused: none of them is an agent worth rejoining."""
     with caplog.at_level("WARNING"):
-        assert await fake_voice(client=FakeClient(blind=True)).agent_is_live("gone") is False
+        assert await fake_voice(client=FakeClient(fails=True)).agent_is_live("gone") is False
 
     assert "could not read the state of voice agent gone" in caplog.text
 
@@ -359,7 +405,7 @@ async def test_stop_agent_stops_the_session_it_started():
     await voice.stop_agent(agent_id)
 
     assert session.calls[1:] == [("stop",)]
-    assert client.stopped == []
+    assert client.agents.stopped == []
 
 
 async def test_stop_agent_asks_agora_directly_for_an_agent_it_does_not_hold():
@@ -367,8 +413,8 @@ async def test_stop_agent_asks_agora_directly_for_an_agent_it_does_not_hold():
 
     await fake_voice(client=client).stop_agent("agent-from-a-previous-process")
 
-    # The call was made, and the failure it raised did not escape.
-    assert client.stopped == ["agent-from-a-previous-process"]
+    # The call was made, in the SDK's shape, and the failure it raised did not escape.
+    assert client.agents.stopped == [(APP_ID, "agent-from-a-previous-process")]
 
 
 # --- /start and DELETE ----------------------------------------------------
@@ -467,6 +513,58 @@ def test_start_greets_the_candidate_in_the_transcript_even_without_voice(client,
     assert greeting["generation"] == 0
     assert "AI" in greeting["text"]
     assert greeting["text"] == prompts.greeting_text("Ada Lovelace")
+
+
+def test_start_with_voice_false_goes_live_without_starting_a_paid_agent(voice_client):
+    """Text mode is a choice the server honours, not a fallback from a failure."""
+    app = voice_client.app
+    voice = StubVoice()
+    app.state.voice = voice
+    interview = create_interview(voice_client)
+
+    response = voice_client.post(
+        f"/api/interviews/{interview['id']}/start", headers=ORIGIN, json={"voice": False}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"voice": {"enabled": False}}
+    assert voice.started == []
+
+    row = repo.get_interview(app.state.db, interview["id"])
+    assert row["status"] == "live"
+    assert row["voice_status"] == "off"
+    assert row["agora_agent_id"] in (None, "")
+    assert [segment["kind"] for segment in segments(app, interview["id"])] == ["greeting"]
+
+
+def test_choosing_text_after_a_voice_start_stops_the_agent_that_was_running(voice_client):
+    app = voice_client.app
+    voice = StubVoice()
+    app.state.voice = voice
+    interview = create_interview(voice_client)
+    voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    voice_client.post(
+        f"/api/interviews/{interview['id']}/start", headers=ORIGIN, json={"voice": False}
+    )
+
+    assert voice.stopped == ["agent-abc"]
+    row = repo.get_interview(app.state.db, interview["id"])
+    assert row["agora_agent_id"] is None
+    assert row["voice_status"] == "off"
+
+
+def test_start_without_a_body_still_asks_for_voice(voice_client):
+    """The Agora callback and older clients post no body; that must mean voice."""
+    app = voice_client.app
+    voice = StubVoice()
+    app.state.voice = voice
+    interview = create_interview(voice_client)
+
+    response = voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    assert response.json()["voice"]["enabled"] is True
+    assert len(voice.started) == 1
 
 
 def test_starting_twice_does_not_greet_twice(client, app, candidate):

@@ -19,11 +19,11 @@ MIN_EXPLANATION_CHARS = 20
 # Whole words with their inflections: "scores" and "ranked" are the same promise
 # broken; "underscored" and "frank" are not.
 FORBIDDEN_STEMS = (
-    r"scor(?:e|es|ed|ing)",
-    r"rank(?:s|ed|ing)?",
+    r"scor(?:e|es|ed|er|ers|ing)",
+    r"rank(?:s|ed|er|ers|ing|ings)?",
     r"personalit(?:y|ies)",
-    r"honest(?:ly)?",
-    r"dishonest(?:ly)?",
+    r"honest(?:y|ly)?",
+    r"dishonest(?:y|ly)?",
 )
 TEXT_FIELDS = ("title", "explanation", "assistance", "uncertainty", "follow_up")
 REF_FIELDS = ("supporting_refs", "opposing_refs")

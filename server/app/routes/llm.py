@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 
 from app import ids
 from app.routes.deps import llm_token
+from app.routes.events import STREAM_HEADERS
 from app.storage import repo
 
 router = APIRouter(prefix="/llm", tags=["llm"])
@@ -47,7 +48,9 @@ async def chat_completions(interview_id: str, request: Request) -> StreamingResp
         raise HTTPException(400, "the transcript is empty")
 
     turn = app.state.controller.run_turn(interview_id, text, source="candidate")
-    return ClosingStreamingResponse(_completion_chunks(turn), media_type="text/event-stream")
+    return ClosingStreamingResponse(
+        _completion_chunks(turn), media_type="text/event-stream", headers=STREAM_HEADERS
+    )
 
 
 class ClosingStreamingResponse(StreamingResponse):

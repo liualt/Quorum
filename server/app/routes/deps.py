@@ -18,6 +18,9 @@ from app.storage import repo
 COOKIE_CANDIDATE = "quorum_candidate"
 COOKIE_REVIEWER = "quorum_reviewer"
 COOKIE_FOR_KIND = {"candidate": COOKIE_CANDIDATE, "reviewer": COOKIE_REVIEWER}
+#: Carries `DEMO_ACCESS_KEY` on `POST /api/interviews`; the web app reads it
+#: from `NEXT_PUBLIC_DEMO_ACCESS_KEY`.
+ACCESS_KEY_HEADER = "X-Quorum-Access-Key"
 
 SECONDS_PER_DAY = 86_400
 
@@ -66,6 +69,22 @@ def require_same_origin(request: Request) -> None:
     origin = request.headers.get("origin") or _referer_origin(request)
     if origin not in request.app.state.settings.allowed_origins:
         raise HTTPException(403, "this request did not come from an allowed origin")
+
+
+def require_access_key(request: Request) -> None:
+    """Refuse to create an interview without the demo access key, when one is set.
+
+    A voice deployment is reachable from the public internet by design (Agora
+    calls back into it), and the Origin check is a header any client can send.
+    The key is what stops a public demo from starting unlimited paid sessions
+    (PRD section 15); with `DEMO_ACCESS_KEY` empty the route is open.
+    """
+    expected = request.app.state.settings.DEMO_ACCESS_KEY
+    if not expected:
+        return
+    presented = request.headers.get(ACCESS_KEY_HEADER, "")
+    if not hmac.compare_digest(expected.encode(), presented.encode()):
+        raise HTTPException(403, "this deployment needs an access key to start an interview")
 
 
 def _referer_origin(request: Request) -> str | None:

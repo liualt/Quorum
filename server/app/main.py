@@ -1,6 +1,8 @@
 """FastAPI app factory: settings, database, event bus, lifespan wiring."""
 
+import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from app.routes import assessment, auth, events, files, interviews, llm, runs, t
 from app.scenario import load_scenario
 from app.storage import db, repo
 from app.storage.events import EventBus
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -79,6 +83,15 @@ async def lifespan(app: FastAPI):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    if not settings.SESSION_SECRET:
+        # Never key every capability hash with a known empty string. A secret
+        # that lasts one process keeps the links working until the next
+        # restart, which is the loudest a default can safely be.
+        settings.SESSION_SECRET = secrets.token_urlsafe(32)
+        logger.warning(
+            "SESSION_SECRET is not set: using a random secret for this process, so every "
+            "candidate and reviewer link stops working when the server restarts"
+        )
 
     app = FastAPI(lifespan=lifespan)
     app.state.settings = settings

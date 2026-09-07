@@ -292,12 +292,24 @@ def run_digest(run: dict) -> dict:
                 f"{result['check_id']}: {result.get('search_calls')} searches, "
                 f"budget {result.get('max_search_calls')}"
             )
+    passed = [r["check_id"] for r in results if r.get("passed")]
+    failed = [r["check_id"] for r in results if not r.get("passed")]
+    status = run.get("status")
+    # A run that timed out has no results to read, and an empty `failed_checks`
+    # there means "nothing is known", not "nothing failed". The outcome line
+    # says which of the two the reader is looking at.
+    outcome = (
+        f"completed: {len(passed)} of {len(results)} checks passed"
+        if status == "completed"
+        else f"did not complete ({status}); no results"
+    )
     return {
         "id": run.get("id"),
-        "status": run.get("status"),
+        "status": status,
+        "outcome": outcome,
         "snapshot_id": run.get("snapshot_id"),
-        "passed_checks": [r["check_id"] for r in results if r.get("passed")],
-        "failed_checks": [r["check_id"] for r in results if not r.get("passed")],
+        "passed_checks": passed,
+        "failed_checks": failed,
         "notes": notes,
     }
 

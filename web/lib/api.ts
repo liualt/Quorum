@@ -124,11 +124,21 @@ export function getInterview(
   return request(base(interviewId), { signal });
 }
 
+/**
+ * Go live. `voice: false` is the candidate choosing text, and the server then
+ * starts no voice agent however it is configured — a paid session nobody joined
+ * is the one thing a public demo must not do.
+ */
 export function startInterview(
   interviewId: string,
+  options: { voice: boolean },
   signal?: AbortSignal,
 ): Promise<StartInterviewResult> {
-  return request(`${base(interviewId)}/start`, { method: "POST", signal });
+  return request(`${base(interviewId)}/start`, {
+    method: "POST",
+    body: { voice: options.voice },
+    signal,
+  });
 }
 
 export function setPaused(
