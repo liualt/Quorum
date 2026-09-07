@@ -1,9 +1,12 @@
-import { ComingSoon } from "@/components/ui/ComingSoon";
+import { Report } from "@/components/evidence/Report";
 
-/** Placeholder for the assessment report (task 11). */
-export default async function AssessmentPage(
-  props: PageProps<"/assessment/[id]">,
-) {
+/**
+ * The assessment report for one interview.
+ *
+ * The server side only unwraps the route param: the report needs the session
+ * cookie and the event stream, both of which live in the browser.
+ */
+export default async function AssessmentPage(props: PageProps<"/assessment/[id]">) {
   const { id } = await props.params;
-  return <ComingSoon title="Assessment" idLabel="Interview" id={id} />;
+  return <Report interviewId={id} />;
 }
