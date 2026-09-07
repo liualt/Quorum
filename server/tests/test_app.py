@@ -8,13 +8,13 @@ the `app`/`client` fixtures otherwise go unexercised in this task.
 import threading
 
 
-def test_health_reports_placeholders_when_later_task_state_is_absent(client):
+def test_health_reports_the_executor_and_placeholders_for_later_tasks(client):
     response = client.get("/api/health")
 
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
-        "executor": "none",
+        "executor": "local",
         "llm_provider": "scripted",
         "llm_model": "",
         "voice_enabled": False,

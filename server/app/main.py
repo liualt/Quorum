@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import Settings, get_settings
+from app.execution.executor import build_executor
 from app.scenario import load_scenario
 from app.storage import db, repo
 from app.storage.events import EventBus
@@ -32,7 +33,7 @@ async def lifespan(app: FastAPI):
     if not scenario_dir.is_absolute():
         scenario_dir = Path(__file__).resolve().parents[1] / scenario_dir
     app.state.scenario = load_scenario(scenario_dir, settings.SCENARIO_ID)
-    # task 3: executor
+    app.state.executor = build_executor(settings)
     # task 5: llm
     # task 6: controller
     # task 7: voice
