@@ -43,6 +43,12 @@ def _snapshot_path(snapshot_dir: str, interview_id: str, snapshot_id: str) -> st
 
 
 def write_snapshot(snapshot_dir, interview_id: str, snapshot_id: str, files: dict[str, str]) -> None:
+    """Write one snapshot. Refuses any name it does not own, so this is never
+    an arbitrary-file-write primitive even if a caller skips `validate_files`."""
+    unknown = [name for name in files if name not in ALLOWED_FILES]
+    if unknown:
+        raise SnapshotError(f"refusing to write unknown files: {', '.join(sorted(unknown))}")
+
     directory = _snapshot_path(str(snapshot_dir), interview_id, snapshot_id)
     os.makedirs(directory, exist_ok=True)
     for name, content in files.items():

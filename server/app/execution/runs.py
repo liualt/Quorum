@@ -7,6 +7,7 @@ runner's own output, and are never invented for a run that did not complete.
 
 import asyncio
 import json
+import logging
 
 from app import ids
 from app.execution.checks import evaluate, results_differ
@@ -19,7 +20,16 @@ from app.execution.runner_protocol import (
 from app.storage import repo
 from app.storage.events import emit
 
+logger = logging.getLogger(__name__)
+
 EXCERPT_BYTES = 4096
+MAX_REPLAYS_PER_RUN = 3
+# Sandbox provisioning and file transfer sit outside the command timeout, so the
+# whole executor call gets its own deadline; without one a stalled control plane
+# holds a run `running` and 409s every later run.
+EXECUTOR_DEADLINE_MARGIN_SECONDS = 40
+# What the candidate is told when the backend itself broke. The reason is logged.
+EXECUTION_FAILED_MESSAGE = "Execution failed before results were produced."
 
 
 class RunError(Exception):
@@ -107,11 +117,23 @@ async def start_run(app, interview_id: str, snapshot_id: str, check_ids: list[st
 
 
 async def start_replay(app, interview_id: str, run_id: str):
-    original = repo.get_run(app.state.db, run_id)
+    """Re-run a completed run's own inputs.
+
+    A replay does not spend the candidate's run budget — it is the reviewer's
+    reproduction, not the candidate's work — but it still takes the one active
+    run slot, and one original can only be replayed a few times.
+    """
+    conn = app.state.db
+    original = repo.get_run(conn, run_id)
     if original is None or original["interview_id"] != interview_id:
         raise RunError(404, "run not found")
     if original["status"] != "completed":
         raise RunError(409, "only a completed run can be replayed")
+    if repo.active_run(conn, interview_id) is not None:
+        raise RunError(409, "a run is already in progress")
+    replays = [row for row in repo.list_runs(conn, interview_id) if row["replay_of"] == run_id]
+    if len(replays) >= MAX_REPLAYS_PER_RUN:
+        raise RunError(409, f"this run has already been replayed {MAX_REPLAYS_PER_RUN} times")
 
     return _insert_and_schedule(
         app,
@@ -135,8 +157,12 @@ async def execute_run(app, run_id: str) -> None:
 
     try:
         fields = await _execute(app, run)
-    except Exception as error:  # a crash here must not leave the run running forever
-        fields = {"status": "failed", "stderr_excerpt": _tail(f"run failed: {error!r}")}
+    except TimeoutError:  # the whole executor call, not just the sandbox command
+        logger.warning("run %s passed its deadline", run_id)
+        fields = {"status": "timeout", "stderr_excerpt": EXECUTION_FAILED_MESSAGE}
+    except Exception:  # a crash here must not leave the run running forever
+        logger.exception("run %s failed before results were produced", run_id)
+        fields = {"status": "failed", "stderr_excerpt": EXECUTION_FAILED_MESSAGE}
     row = repo.update_run(conn, run_id, finished_at=ids.now_iso(), **fields)
 
     row, replay_differs = _compare_with_original(conn, row)
@@ -163,11 +189,14 @@ async def _execute(app, run) -> dict:
     files = build_workspace_files(scenario, repo.row_json(snapshot, "files_json"))
     checks = _checks_by_id(scenario, repo.row_json(run, "check_ids_json"))
 
-    result = await app.state.executor.run(
-        files,
-        build_script(checks),
-        timeout_s=settings.RUN_TIMEOUT_SECONDS,
-        output_cap=settings.RUN_OUTPUT_CAP_BYTES,
+    result = await asyncio.wait_for(
+        app.state.executor.run(
+            files,
+            build_script(checks),
+            timeout_s=settings.RUN_TIMEOUT_SECONDS,
+            output_cap=settings.RUN_OUTPUT_CAP_BYTES,
+        ),
+        timeout=settings.RUN_TIMEOUT_SECONDS + EXECUTOR_DEADLINE_MARGIN_SECONDS,
     )
     fields = {
         "status": result.status,

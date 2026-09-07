@@ -6,6 +6,7 @@ believes results when the status is `completed`.
 """
 
 import asyncio
+import logging
 import os
 import shutil
 import signal
@@ -16,17 +17,16 @@ import time
 from dataclasses import dataclass
 from typing import Protocol
 
-from e2b import (
-    AsyncSandbox,
-    AuthenticationException,
-    CommandExitException,
-    SandboxException,
-    TimeoutException,
-)
+from e2b import AsyncSandbox, CommandExitException, TimeoutException
 
 from app.config import Settings
 
+logger = logging.getLogger(__name__)
+
 TRUNCATION_MARKER = "\n[truncated]"
+# What the candidate is told when the sandbox itself failed. The reason is a
+# server-side concern and is logged, not shown.
+UNAVAILABLE_MESSAGE = "The sandbox was unavailable, so nothing was run."
 SANDBOX_DIR = "/home/user/app"
 SCRIPT_NAME = "script.json"
 # The sandbox has to outlive the command so its own timeout never races ours.
@@ -59,19 +59,19 @@ def truncate(text: str, cap: int) -> str:
 
 
 def classify_sandbox_error(error: Exception) -> tuple[str, str, str, int | None]:
-    """Map an e2b failure to (status, stdout, stderr, exit_code).
+    """Map a failure from the E2B path to (status, stdout, stderr, exit_code).
 
-    A rejected key is `unavailable` rather than `failed`: nothing about the
-    candidate's code was tested, and a run that never ran must not read as one
-    that ran and broke.
+    A non-zero exit is `completed`: the candidate's code ran, and whether its
+    output is usable is `parse_output`'s call. Everything else — a rejected
+    key, a rate limit, a transport error — is `unavailable`: nothing about the
+    candidate's code was tested, so the run must not read as one that ran and
+    broke.
     """
-    if isinstance(error, AuthenticationException):
-        return "unavailable", "", str(error), None
     if isinstance(error, TimeoutException):
         return "timeout", "", str(error), None
     if isinstance(error, CommandExitException):
-        return "failed", error.stdout, error.stderr, error.exit_code
-    return "failed", "", str(error), None
+        return "completed", error.stdout, error.stderr, error.exit_code
+    return "unavailable", "", UNAVAILABLE_MESSAGE, None
 
 
 def _elapsed_ms(started: float) -> int:
@@ -164,8 +164,10 @@ class E2BExecutor:
                 sandbox_id=sandbox_id,
                 duration_ms=_elapsed_ms(started),
             )
-        except (SandboxException, AuthenticationException) as error:
+        except Exception as error:
             status, stdout, stderr, exit_code = classify_sandbox_error(error)
+            if status == "unavailable":
+                logger.exception("E2B run failed before any results were produced")
             return ExecResult(
                 status=status,
                 stdout=truncate(stdout, output_cap),
@@ -178,8 +180,8 @@ class E2BExecutor:
             if sandbox is not None:
                 try:
                     await sandbox.kill()
-                except SandboxException:
-                    pass
+                except Exception:  # a leaked sandbox expires on its own timeout
+                    logger.warning("could not kill sandbox %s", sandbox_id, exc_info=True)
 
 
 class UnavailableExecutor:

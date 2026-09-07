@@ -12,7 +12,7 @@ import pytest
 
 from app.execution import runs
 from app.execution.executor import ExecResult
-from app.execution.runs import RunError, allowed_check_ids, run_view
+from app.execution.runs import EXECUTION_FAILED_MESSAGE, RunError, allowed_check_ids, run_view
 from app.storage import repo, snapshots
 from app.storage.snapshots import SnapshotError
 from tests.conftest import seed_interview, seed_snapshot
@@ -58,6 +58,21 @@ class FailingExecutor:
             sandbox_id=None,
             duration_ms=5,
         )
+
+
+class StallingExecutor:
+    name = "local"
+
+    async def run(self, files, script, *, timeout_s, output_cap):
+        await asyncio.sleep(30)
+        raise AssertionError("the run deadline should have cancelled this")
+
+
+class CrashingExecutor:
+    name = "local"
+
+    async def run(self, files, script, *, timeout_s, output_cap):
+        raise RuntimeError("internal detail the candidate must not see")
 
 
 def runner_output(scenario, check_ids, *, mangle_first_step=False):
@@ -273,6 +288,34 @@ async def test_unparseable_output_fails_the_run(live_app, seeded):
     assert "Traceback" in stored["stdout_excerpt"]
 
 
+async def test_a_stalled_executor_hits_the_run_deadline(live_app, seeded, monkeypatch):
+    interview, snapshot = seeded
+    live_app.state.executor = StallingExecutor()
+    monkeypatch.setattr(runs, "EXECUTOR_DEADLINE_MARGIN_SECONDS", 0)
+    live_app.state.settings.RUN_TIMEOUT_SECONDS = 0
+
+    run = await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+    await drain(live_app)
+
+    stored = repo.get_run(live_app.state.db, run["id"])
+    assert stored["status"] == "timeout"
+    assert stored["results_json"] is None
+
+
+async def test_a_crashing_executor_does_not_leak_its_error_to_the_candidate(live_app, seeded):
+    interview, snapshot = seeded
+    live_app.state.executor = CrashingExecutor()
+
+    run = await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+    await drain(live_app)
+
+    stored = repo.get_run(live_app.state.db, run["id"])
+    assert stored["status"] == "failed"
+    assert stored["results_json"] is None
+    assert stored["stderr_excerpt"] == EXECUTION_FAILED_MESSAGE
+    assert "internal detail" not in stored["stderr_excerpt"]
+
+
 # --- replay ---------------------------------------------------------------
 
 async def test_replay_reruns_the_original_and_leaves_it_untouched(live_app, seeded, scenario):
@@ -325,6 +368,70 @@ async def test_replay_requires_a_completed_original(live_app, seeded):
     assert excinfo.value.status_code == 409
 
 
+async def test_replay_while_a_run_is_active_is_rejected(live_app, seeded):
+    interview, snapshot = seeded
+
+    original = await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+    await drain(live_app)
+    await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+
+    with pytest.raises(RunError) as excinfo:
+        await runs.start_replay(live_app, interview["id"], original["id"])
+
+    assert excinfo.value.status_code == 409
+    await drain(live_app)
+
+
+async def test_replay_limit_rejects_the_next_replay(live_app, seeded, scenario):
+    interview, snapshot = seeded
+
+    original = await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+    await drain(live_app)
+    for index in range(runs.MAX_REPLAYS_PER_RUN):
+        repo.insert_run(
+            live_app.state.db,
+            id=f"run_replay{index}",
+            interview_id=interview["id"],
+            snapshot_id=snapshot["id"],
+            fixture_version=scenario.fixture_version,
+            check_version=scenario.check_version,
+            check_ids_json=json.dumps([INITIAL_CHECK]),
+            input_hash="hash",
+            status="completed",
+            executor="local",
+            replay_of=original["id"],
+        )
+
+    with pytest.raises(RunError) as excinfo:
+        await runs.start_replay(live_app, interview["id"], original["id"])
+
+    assert excinfo.value.status_code == 409
+
+
+async def test_replays_do_not_count_towards_the_candidates_run_budget(live_app, seeded, scenario):
+    interview, snapshot = seeded
+    original = await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+    await drain(live_app)
+    for index in range(live_app.state.settings.MAX_RUNS_PER_INTERVIEW):
+        repo.insert_run(
+            live_app.state.db,
+            id=f"run_seed{index}",
+            interview_id=interview["id"],
+            snapshot_id=snapshot["id"],
+            fixture_version=scenario.fixture_version,
+            check_version=scenario.check_version,
+            check_ids_json=json.dumps([INITIAL_CHECK]),
+            input_hash="hash",
+            status="completed",
+            executor="local",
+        )
+
+    replay = await runs.start_replay(live_app, interview["id"], original["id"])
+    await drain(live_app)
+
+    assert repo.get_run(live_app.state.db, replay["id"])["status"] == "completed"
+
+
 # --- snapshot storage -----------------------------------------------------
 
 def test_validate_files_rejects_a_read_only_name():
@@ -360,6 +467,14 @@ def test_content_hash_is_stable_across_key_order():
 
     assert first == second
     assert first != third
+
+
+def test_write_snapshot_refuses_a_name_it_does_not_own(tmp_path):
+    with pytest.raises(SnapshotError):
+        snapshots.write_snapshot(str(tmp_path), "itv_1", "snap_1", {"../../escape.py": "x"})
+    with pytest.raises(SnapshotError):
+        snapshots.write_snapshot(str(tmp_path), "itv_1", "snap_1", {"index.py": "x"})
+    assert not (tmp_path / "itv_1" / "snap_1" / "index.py").exists()
 
 
 def test_snapshots_round_trip_on_disk(tmp_path):

@@ -8,6 +8,7 @@ import pytest
 from e2b import (
     AuthenticationException,
     CommandExitException,
+    RateLimitException,
     SandboxException,
     TimeoutException,
 )
@@ -15,6 +16,7 @@ from e2b import (
 from app.config import Settings
 from app.execution.executor import (
     TRUNCATION_MARKER,
+    UNAVAILABLE_MESSAGE,
     E2BExecutor,
     LocalExecutor,
     UnavailableExecutor,
@@ -101,26 +103,32 @@ def test_local_executor_is_labelled_as_the_development_executor():
 
 
 @pytest.mark.parametrize(
-    "error,expected",
+    "error",
     [
-        (TimeoutException("too slow"), "timeout"),
-        (SandboxException("boom"), "failed"),
+        SandboxException("boom"),
+        AuthenticationException("nope"),
+        RateLimitException("slow down"),
+        RuntimeError("some httpx transport failure"),
     ],
 )
-def test_classify_sandbox_error_maps_status(error, expected):
-    status, _stdout, _stderr, exit_code = classify_sandbox_error(error)
+def test_classify_sandbox_error_reports_infrastructure_failures_as_unavailable(error):
+    status, stdout, stderr, exit_code = classify_sandbox_error(error)
 
-    assert status == expected
+    assert status == "unavailable"
+    assert stdout == ""
+    assert exit_code is None
+    # The candidate is told the sandbox failed, not how.
+    assert stderr == UNAVAILABLE_MESSAGE
+
+
+def test_classify_sandbox_error_maps_a_sandbox_timeout():
+    status, _stdout, _stderr, exit_code = classify_sandbox_error(TimeoutException("too slow"))
+
+    assert status == "timeout"
     assert exit_code is None
 
 
-def test_classify_sandbox_error_keeps_command_output():
+def test_classify_sandbox_error_keeps_output_from_a_command_that_ran():
     error = CommandExitException(stderr="bad", stdout="partial", exit_code=1, error=None)
 
-    assert classify_sandbox_error(error) == ("failed", "partial", "bad", 1)
-
-
-def test_classify_sandbox_error_treats_a_rejected_key_as_unavailable():
-    status, _stdout, _stderr, _exit_code = classify_sandbox_error(AuthenticationException("nope"))
-
-    assert status == "unavailable"
+    assert classify_sandbox_error(error) == ("completed", "partial", "bad", 1)
