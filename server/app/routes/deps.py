@@ -8,6 +8,8 @@ database as an HMAC, so a copy of the database hands out no sessions.
 import hashlib
 import hmac
 import secrets
+import time
+from collections import deque
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
@@ -18,11 +20,14 @@ from app.storage import repo
 COOKIE_CANDIDATE = "quorum_candidate"
 COOKIE_REVIEWER = "quorum_reviewer"
 COOKIE_FOR_KIND = {"candidate": COOKIE_CANDIDATE, "reviewer": COOKIE_REVIEWER}
-#: Carries `DEMO_ACCESS_KEY` on `POST /api/interviews`; the web app reads it
-#: from `NEXT_PUBLIC_DEMO_ACCESS_KEY`.
-ACCESS_KEY_HEADER = "X-Quorum-Access-Key"
+#: Carries `DEMO_ACCESS_KEY` on `POST /api/interviews`. The web app sends the
+#: key the candidate typed as the `access_key` body field instead; either works.
+ACCESS_KEY_HEADER = "X-Access-Key"
 
 SECONDS_PER_DAY = 86_400
+SECONDS_PER_HOUR = 3_600
+#: The per-IP window key that also counts every create, whatever its IP.
+_TOTAL = "*"
 
 
 def new_token() -> str:
@@ -71,20 +76,100 @@ def require_same_origin(request: Request) -> None:
         raise HTTPException(403, "this request did not come from an allowed origin")
 
 
-def require_access_key(request: Request) -> None:
+def access_key_required(settings: Settings) -> bool:
+    return bool(settings.DEMO_ACCESS_KEY)
+
+
+def require_access_key(request: Request, body_key: str | None = None) -> None:
     """Refuse to create an interview without the demo access key, when one is set.
 
     A voice deployment is reachable from the public internet by design (Agora
     calls back into it), and the Origin check is a header any client can send.
     The key is what stops a public demo from starting unlimited paid sessions
-    (PRD section 15); with `DEMO_ACCESS_KEY` empty the route is open.
+    (PRD section 15); with `DEMO_ACCESS_KEY` empty the route is open. The key
+    may arrive in the `X-Access-Key` header or as the `access_key` body field,
+    which is what the consent form sends.
     """
     expected = request.app.state.settings.DEMO_ACCESS_KEY
     if not expected:
         return
-    presented = request.headers.get(ACCESS_KEY_HEADER, "")
-    if not hmac.compare_digest(expected.encode(), presented.encode()):
+    presented = request.headers.get(ACCESS_KEY_HEADER) or body_key or ""
+    if not presented.strip():
         raise HTTPException(403, "this deployment needs an access key to start an interview")
+    if not hmac.compare_digest(expected.encode(), presented.strip().encode()):
+        raise HTTPException(403, "that access key is not valid for this deployment")
+
+
+class CreateQuota:
+    """A per-process sliding window over interview creations, per IP and in total.
+
+    Per-IP alone would not bound spend: the web app proxies `/api` through
+    Next.js, so every browser can look like one address, and a public
+    deployment may sit behind a proxy that rewrites the address anyway. The
+    total window is the bound; the per-IP window only stops one client from
+    using it all up when addresses are distinguishable.
+    """
+
+    def __init__(self, limit_per_hour: int) -> None:
+        self.limit = limit_per_hour
+        self._windows: dict[str, deque[float]] = {}
+
+    def _recent(self, key: str, now: float) -> deque[float]:
+        window = self._windows.setdefault(key, deque())
+        while window and window[0] <= now - SECONDS_PER_HOUR:
+            window.popleft()
+        return window
+
+    def check(self, client_ip: str, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        for key in (client_ip, _TOTAL):
+            if len(self._recent(key, now)) >= self.limit:
+                raise HTTPException(
+                    429,
+                    f"this deployment allows {self.limit} new interviews per hour;"
+                    " please try again later",
+                )
+
+    def record(self, client_ip: str, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        for key in (client_ip, _TOTAL):
+            self._recent(key, now).append(now)
+
+
+def create_quota(request: Request) -> CreateQuota:
+    """The process-wide creation window, made on first use so tests get a fresh one per app."""
+    state = request.app.state
+    quota = getattr(state, "create_quota", None)
+    if quota is None:
+        quota = state.create_quota = CreateQuota(state.settings.MAX_INTERVIEWS_PER_HOUR)
+    return quota
+
+
+def client_ip(request: Request) -> str:
+    """The address the hourly window is keyed by: the first forwarded hop, else the peer."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def require_creation_quota(request: Request) -> None:
+    """Refuse a create that would exceed the hourly window or the active-interview cap.
+
+    Both apply whether or not an access key is configured: a leaked key must
+    not turn into unlimited paid sessions either. The caller records the
+    creation with `create_quota(request).record(...)` once it has happened, so
+    a refused or failed create does not use up the window.
+    """
+    settings = request.app.state.settings
+    create_quota(request).check(client_ip(request))
+    active = repo.count_active_interviews(request.app.state.db)
+    if active >= settings.MAX_ACTIVE_INTERVIEWS:
+        raise HTTPException(
+            429,
+            f"this deployment allows {settings.MAX_ACTIVE_INTERVIEWS} interviews in progress"
+            " at once; please try again once one has finished",
+        )
 
 
 def _referer_origin(request: Request) -> str | None:

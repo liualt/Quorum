@@ -9,6 +9,7 @@
  */
 
 import type {
+  AdmissionView,
   AssessmentView,
   CreateInterviewResult,
   DisputeView,
@@ -99,13 +100,24 @@ const base = (interviewId: string) =>
 
 /* ------------------------------------------------------------------ lifecycle */
 
+/** Whether this deployment asks for an access key before creating an interview. */
+export function getAdmission(signal?: AbortSignal): Promise<AdmissionView> {
+  return request("/api/admission", { signal });
+}
+
 export function createInterview(
   displayName: string,
+  accessKey?: string,
   signal?: AbortSignal,
 ): Promise<CreateInterviewResult> {
   return request("/api/interviews", {
     method: "POST",
-    body: { display_name: displayName, consent: true },
+    body: {
+      display_name: displayName,
+      consent: true,
+      // Only sent when the candidate typed one: an open deployment ignores it.
+      ...(accessKey ? { access_key: accessKey } : {}),
+    },
     signal,
   });
 }

@@ -18,17 +18,21 @@ from app.interview.controller import claims_task_prefix, segment_view
 from app.interview.state import ControllerState
 from app.routes.deps import (
     COOKIE_CANDIDATE,
+    access_key_required,
+    client_ip,
+    create_quota,
     hash_token,
     llm_token,
     new_token,
     require_access_key,
     require_candidate,
+    require_creation_quota,
     require_participant,
     require_same_origin,
     set_capability_cookie,
 )
 from app.scenario import public_check
-from app.storage import repo
+from app.storage import repo, usage
 from app.storage.events import emit
 
 logger = logging.getLogger(__name__)
@@ -37,6 +41,8 @@ router = APIRouter(prefix="/api/interviews", tags=["interviews"])
 mutations = APIRouter(
     prefix="/api/interviews", tags=["interviews"], dependencies=[Depends(require_same_origin)]
 )
+#: A read the consent page makes before it knows what to ask for.
+admission = APIRouter(prefix="/api/admission", tags=["interviews"])
 
 #: Everything `/start` records about the conversation the agent joins.
 AGORA_COLUMNS = ("agora_channel", "agora_agent_id", "agora_uid", "agora_agent_uid")
@@ -58,6 +64,9 @@ def initial_state_json() -> str:
 class CreateInterviewRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=120)
     consent: Literal[True]
+    #: The deployment's `DEMO_ACCESS_KEY`, when `GET /api/admission` says one
+    #: is needed. The `X-Access-Key` header is the other way to present it.
+    access_key: str | None = Field(default=None, max_length=256)
 
 
 class StartInterviewRequest(BaseModel):
@@ -71,13 +80,24 @@ class SetPausedRequest(BaseModel):
     paused: bool
 
 
-@mutations.post("", status_code=201, dependencies=[Depends(require_access_key)])
+@admission.get("")
+async def get_admission(request: Request) -> dict:
+    """What the consent form must collect before it can create an interview."""
+    return {"access_key_required": access_key_required(request.app.state.settings)}
+
+
+@mutations.post("", status_code=201)
 async def create_interview(
     body: CreateInterviewRequest, request: Request, response: Response
 ) -> dict:
     app = request.app
     settings = app.state.settings
     scenario = app.state.scenario
+
+    # The key is checked before the quotas, so a wrong key cannot probe or use
+    # up the window; the window is only charged for an interview that exists.
+    require_access_key(request, body.access_key)
+    require_creation_quota(request)
 
     interview_id = ids.new_id("itv")
     repo.create_interview(
@@ -103,6 +123,7 @@ async def create_interview(
             token_hash=hash_token(settings, token),
         )
 
+    create_quota(request).record(client_ip(request))
     set_capability_cookie(response, COOKIE_CANDIDATE, tokens["candidate"], settings)
     return {
         "id": interview_id,
@@ -153,6 +174,11 @@ async def start_interview(
             **agora,
         )
         _ensure_greeting(app, interview_id, greeting)
+        if voice_status == "connecting":
+            # A paid agent is in the channel from here until `/finish` stops it.
+            usage.voice_started(app.state.db, interview_id)
+        elif voice_status == "disconnected":
+            usage.record(app.state.db, interview_id, provider_failures=1)
         emit(app.state.db, app.state.bus, interview_id, "voice_status", {"status": voice_status})
         return {"voice": join}
 
@@ -176,6 +202,7 @@ async def _join_voice(
         # left in the channel is taken down rather than billed until it idles.
         if stored:
             await voice.stop_agent(stored)
+            usage.voice_stopped(app.state.db, interview_id)
         return {"enabled": False}, "off", dict.fromkeys(AGORA_COLUMNS) if stored else {}
 
     # An id on the row is not an agent in the channel: one left alone hangs up.
@@ -286,6 +313,7 @@ async def set_paused(
     if not body.paused:
         # Paused time is excluded from the session cap, so it is banked here.
         fields["paused_ms"] = (row["paused_ms"] or 0) + _elapsed_ms(row["paused_at"])
+        usage.record(app.state.db, interview_id, paused_seconds=_elapsed_ms(row["paused_at"]) / 1000)
 
     repo.update_interview(app.state.db, interview_id, **fields)
     emit(app.state.db, app.state.bus, interview_id, "pause_changed", {"paused": body.paused})
@@ -304,7 +332,11 @@ async def finish_interview(
     resumes it: every step is safe to repeat, and an assessment that was
     already stored is kept rather than rebuilt.
     """
-    app = request.app
+    return await complete_interview(request.app, interview_id)
+
+
+async def complete_interview(app, interview_id: str) -> dict:
+    """The whole of `/finish`, for the route and for the session watchdog alike."""
     async with _finish_lock(app, interview_id):
         current = repo.get_interview(app.state.db, interview_id)
         if current is None:
@@ -368,13 +400,27 @@ async def _stop_voice(app, current) -> None:
     agent_id = current["agora_agent_id"]
     if voice is None or not agent_id:
         return
+    stopped = False
     try:
-        await asyncio.wait_for(voice.stop_agent(agent_id), timeout=VOICE_STOP_TIMEOUT_SECONDS)
+        stopped = await asyncio.wait_for(
+            voice.stop_agent(agent_id), timeout=VOICE_STOP_TIMEOUT_SECONDS
+        )
     except TimeoutError:
         logger.warning(
             "finishing %s: the voice agent %s did not stop within %ss",
             current["id"], agent_id, VOICE_STOP_TIMEOUT_SECONDS,
         )
+    except Exception as failure:
+        logger.warning(
+            "finishing %s: the voice agent %s could not be stopped (%s)",
+            current["id"], agent_id, type(failure).__name__,
+        )
+    # `None` is a service that reports nothing; only an explicit refusal, an
+    # error, or a timeout counts as a provider failure. Either way the session
+    # is billed up to now: an agent that would not stop hangs up on its idle timeout.
+    if stopped is False:
+        usage.record(app.state.db, current["id"], provider_failures=1)
+    usage.voice_stopped(app.state.db, current["id"])
 
 
 async def _wait_for_active_run(app, interview_id: str) -> None:
@@ -385,6 +431,15 @@ async def _wait_for_active_run(app, interview_id: str) -> None:
             logger.warning("finishing %s with a run still active", interview_id)
             return
         await asyncio.sleep(FINISH_POLL_SECONDS)
+
+
+@router.get("/{interview_id}/usage")
+async def get_usage(request: Request, participant=Depends(require_participant)) -> dict:
+    """Aggregate usage counters for costing (PRD section 15); no transcript, no code."""
+    row, _ = participant
+    return usage.get(request.app.state.db, row["id"]) or {
+        "interview_id": row["id"], "updated_at": None, **dict.fromkeys(usage.COUNTERS, 0)
+    }
 
 
 @mutations.delete("/{interview_id}", status_code=204, response_class=Response)

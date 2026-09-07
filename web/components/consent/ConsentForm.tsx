@@ -7,7 +7,7 @@ import { Button, ButtonLink } from "@/components/ui/Button";
 import { CopyField } from "@/components/ui/CopyField";
 import { ErrorText } from "@/components/ui/ErrorText";
 import { Panel } from "@/components/ui/Panel";
-import { ApiError, createInterview } from "@/lib/api";
+import { ApiError, createInterview, getAdmission } from "@/lib/api";
 import type { CreateInterviewResult } from "@/lib/types";
 
 /** The wording the candidate agrees to. Do not paraphrase it. */
@@ -19,12 +19,13 @@ const CONSENT_TEXT =
  * reason it is disabled. `noValidate` is set on the form, so the browser will
  * not say this for us.
  */
-function blockedReason(hasName: boolean, consented: boolean): string | null {
+function blockedReason(hasName: boolean, consented: boolean, needsKey: boolean): string | null {
   if (!hasName && !consented) {
     return "Enter a display name and tick the consent box to enable this button.";
   }
   if (!hasName) return "Enter a display name to enable this button.";
   if (!consented) return "Tick the consent box to enable this button.";
+  if (needsKey) return "Enter the access key you were given to enable this button.";
   return null;
 }
 
@@ -32,20 +33,43 @@ export function ConsentForm() {
   const nameId = useId();
   const nameHintId = useId();
   const consentId = useId();
+  const keyId = useId();
+  const keyHintId = useId();
   const submitHintId = useId();
 
   const [displayName, setDisplayName] = useState("");
   const [consented, setConsented] = useState(false);
+  // Only a deployment with `DEMO_ACCESS_KEY` set asks for a key, and the form
+  // learns that from `/api/admission`. Until the answer arrives — or if it
+  // never does — the form looks exactly as it does on an open deployment, and
+  // the server's 403 says what was missing.
+  const [accessKeyRequired, setAccessKeyRequired] = useState(false);
+  const [accessKey, setAccessKey] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<CreateInterviewResult | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getAdmission(controller.signal)
+      .then((admission) => setAccessKeyRequired(admission.access_key_required))
+      .catch(() => {
+        // An unreachable server surfaces on submit; nothing to say yet.
+      });
+    return () => controller.abort();
+  }, []);
 
   if (created) {
     return <InterviewCreated result={created} />;
   }
 
   const trimmedName = displayName.trim();
-  const blocked = blockedReason(trimmedName.length > 0, consented);
+  const trimmedKey = accessKey.trim();
+  const blocked = blockedReason(
+    trimmedName.length > 0,
+    consented,
+    accessKeyRequired && trimmedKey.length === 0,
+  );
   const canSubmit = blocked === null && !submitting;
 
   const submit = async (event: React.FormEvent) => {
@@ -55,7 +79,7 @@ export function ConsentForm() {
     setSubmitting(true);
     setError(null);
     try {
-      setCreated(await createInterview(trimmedName));
+      setCreated(await createInterview(trimmedName, trimmedKey || undefined));
     } catch (cause) {
       setError(
         cause instanceof ApiError
@@ -111,6 +135,32 @@ export function ConsentForm() {
           />
           <span>{CONSENT_TEXT}</span>
         </label>
+
+        {accessKeyRequired ? (
+          <div>
+            <label htmlFor={keyId} className="mb-1 block text-sm font-medium">
+              Access key
+            </label>
+            <input
+              id={keyId}
+              name="access_key"
+              type="password"
+              required
+              maxLength={256}
+              autoComplete="off"
+              value={accessKey}
+              onChange={(event) => setAccessKey(event.target.value)}
+              aria-describedby={keyHintId}
+              className="border-border-strong bg-background text-foreground min-h-11 w-full
+                rounded-lg border px-3 text-base transition-colors duration-200
+                placeholder:text-muted-foreground focus:border-accent"
+            />
+            <p id={keyHintId} className="text-muted-foreground mt-1 text-sm">
+              This deployment is invitation-only. Enter the key you were given
+              with your invitation.
+            </p>
+          </div>
+        ) : null}
 
         {error ? <ErrorText>{error}</ErrorText> : null}
 

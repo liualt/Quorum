@@ -31,9 +31,25 @@ function union(set: Set<string>, ids: string[]): Set<string> {
 export interface CodeSeed {
   files: FileMap;
   snapshotId: string | null;
+  /** The server's hash of `files`, when they came from a saved snapshot. */
+  contentHash: string | null;
   runs: RunView[];
   availableCheckIds: string[];
 }
+
+/**
+ * The source last shown as saved, with the snapshot that holds it.
+ *
+ * The three move together: a snapshot id is only meaningful next to the files
+ * it was cut from, so nothing may replace one without the others.
+ */
+interface SavedSource {
+  files: FileMap;
+  snapshotId: string | null;
+  contentHash: string | null;
+}
+
+const NOTHING_SAVED: SavedSource = { files: {}, snapshotId: null, contentHash: null };
 
 /**
  * The code half of the workspace: the editable files, their saved snapshot,
@@ -42,6 +58,13 @@ export interface CodeSeed {
  * Runs are keyed by id and upserted from both the `POST /runs` response and
  * the event stream; a run that has already finished is never regressed to an
  * earlier state, whichever of the two arrives second.
+ *
+ * The saved snapshot is owned by the `PUT /files` response, which is the one
+ * place the id and the source it holds are known together. A `snapshot_saved`
+ * event carries the id and content hash but not the source, so it is adopted
+ * only when its hash matches what is already shown as saved: the stream
+ * replays the whole history on every reconnect, and an older snapshot's event
+ * must not move the "saved" marker off newer work.
  */
 export function useCodeAndRuns(
   interviewId: string,
@@ -50,8 +73,7 @@ export function useCodeAndRuns(
   active: boolean,
 ) {
   const [files, setFiles] = useState<FileMap>({});
-  const [savedFiles, setSavedFiles] = useState<FileMap>({});
-  const [snapshotId, setSnapshotId] = useState<string | null>(null);
+  const [saved, setSaved] = useState<SavedSource>(NOTHING_SAVED);
   const [saving, setSaving] = useState(false);
   const [runs, setRuns] = useState<Map<string, RunView>>(() => new Map());
   const [selectedChecks, setSelectedChecks] = useState<Set<string>>(() => new Set());
@@ -67,14 +89,21 @@ export function useCodeAndRuns(
 
   const seed = useCallback((data: CodeSeed) => {
     setFiles(data.files);
-    setSavedFiles(data.files);
-    setSnapshotId(data.snapshotId);
+    setSaved({ files: data.files, snapshotId: data.snapshotId, contentHash: data.contentHash });
     setSelectedChecks(new Set(data.availableCheckIds));
     setRuns(new Map(data.runs.map((run) => [run.id, run])));
   }, []);
 
   const setFile = useCallback((name: string, content: string) => {
     setFiles((prev) => ({ ...prev, [name]: content }));
+  }, []);
+
+  const noteSnapshotSaved = useCallback((snapshotId: string, contentHash: string) => {
+    setSaved((prev) =>
+      prev.contentHash === contentHash && prev.snapshotId !== snapshotId
+        ? { ...prev, snapshotId }
+        : prev,
+    );
   }, []);
 
   const upsertRun = useCallback((run: RunView) => {
@@ -108,6 +137,8 @@ export function useCodeAndRuns(
       ),
     [scenarioChecks, unlockedChecks],
   );
+  const savedFiles = saved.files;
+  const snapshotId = saved.snapshotId;
   const dirtyFiles = useMemo(
     () => new Set(Object.keys(files).filter((name) => files[name] !== savedFiles[name])),
     [files, savedFiles],
@@ -129,10 +160,15 @@ export function useCodeAndRuns(
     setSaving(true);
     setError(null);
     try {
-      const saved = await saveFiles(interviewId, snapshot);
-      setSavedFiles(snapshot);
-      setSnapshotId(saved.snapshot_id);
-      setStatus(`Saved snapshot ${saved.snapshot_id}`);
+      const result = await saveFiles(interviewId, snapshot);
+      // The files sent, not the editor's current ones: an edit made while the
+      // request was in flight stays unsaved.
+      setSaved({
+        files: snapshot,
+        snapshotId: result.snapshot_id,
+        contentHash: result.content_hash,
+      });
+      setStatus(`Saved snapshot ${result.snapshot_id}`);
     } catch (cause) {
       setError(errorMessage(cause, "Could not save. Try again."));
     } finally {
@@ -186,7 +222,7 @@ export function useCodeAndRuns(
     dirty,
     needsSave,
     snapshotId,
-    setSnapshotId,
+    noteSnapshotSaved,
     saving,
     checks,
     selectedChecks,

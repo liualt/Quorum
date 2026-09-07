@@ -161,3 +161,181 @@ def test_classify_sandbox_error_keeps_output_from_a_command_that_ran():
     error = CommandExitException(stderr="bad", stdout="partial", exit_code=1, error=None)
 
     assert classify_sandbox_error(error) == ("completed", "partial", "bad", 1)
+
+
+FLOOD_BYTES = 5 * 1024 * 1024
+
+
+def _flood_runner(stream: str) -> dict[str, str]:
+    other = "stderr" if stream == "stdout" else "stdout"
+    return {"runner.py": (
+        "import sys\n"
+        "sys.stdin.read()\n"
+        "chunk = b'x' * 65536\n"
+        f"for _ in range({FLOOD_BYTES} // len(chunk)):\n"
+        f"    sys.{stream}.buffer.write(chunk)\n"
+        f"sys.{stream}.buffer.flush()\n"
+        f"print('done', file=sys.{other})\n"
+    )}
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+async def test_local_executor_bounds_a_flooding_stream_at_source(stream):
+    """5 MB on one pipe: the child finishes, memory stays at the cap, and the
+    other stream still carries what the child said after the flood."""
+    cap = 4096
+    result = await LocalExecutor().run(_flood_runner(stream), "{}", timeout_s=20, output_cap=cap)
+
+    assert result.status == "completed"
+    assert result.exit_code == 0
+    flooded = getattr(result, stream)
+    other = getattr(result, "stderr" if stream == "stdout" else "stdout")
+    assert flooded == "x" * cap + TRUNCATION_MARKER
+    assert other.strip() == "done"
+    assert result.duration_ms < 10_000
+
+
+async def test_local_executor_keeps_the_head_of_a_flood_that_times_out():
+    files = {"runner.py": (
+        "import sys, time\n"
+        "sys.stdin.read()\n"
+        "print('head', flush=True)\n"
+        "while True:\n"
+        "    sys.stdout.buffer.write(b'y' * 65536)\n"
+        "    sys.stdout.buffer.flush()\n"
+    )}
+    result = await LocalExecutor().run(files, "{}", timeout_s=1, output_cap=200)
+
+    assert result.status == "timeout"
+    assert result.stdout.startswith("head")
+    assert result.stdout.endswith(TRUNCATION_MARKER)
+    assert len(result.stdout.encode()) <= 200 + len(TRUNCATION_MARKER)
+    assert result.duration_ms < 10_000
+
+
+def _pid_alive(pid: int) -> bool:
+    import os
+    import subprocess
+
+    if os.name == "nt":
+        listing = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True
+        ).stdout
+        return str(pid) in listing
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def test_cancelling_the_local_executor_kills_the_child_promptly(tmp_path):
+    """A06: cancellation must not leave the child to the execution timeout."""
+    import asyncio
+    import time
+
+    pid_file = tmp_path / "pid"
+    files = {"runner.py": (
+        "import os, sys, time\n"
+        "sys.stdin.read()\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )}
+    task = asyncio.create_task(LocalExecutor().run(files, "{}", timeout_s=60, output_cap=100))
+    deadline = time.monotonic() + 10
+    while not pid_file.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    pid = int(pid_file.read_text())
+    assert _pid_alive(pid)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    deadline = time.monotonic() + 2
+    while _pid_alive(pid) and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert not _pid_alive(pid)
+
+
+class _FakeHandle:
+    def __init__(self, chunks: list[str], on_stdout, on_stderr):
+        self._chunks, self._on_stdout, self._on_stderr = chunks, on_stdout, on_stderr
+        self.killed = False
+
+    async def kill(self) -> bool:
+        self.killed = True
+        return True
+
+    async def wait(self):
+        for chunk in self._chunks:
+            if self.killed:
+                break
+            await self._on_stdout(chunk)
+        if self.killed:
+            raise CommandExitException(stdout="".join(self._chunks), stderr="", exit_code=137, error=None)
+        from e2b import CommandResult
+
+        return CommandResult(stdout="".join(self._chunks), stderr="", exit_code=0, error=None)
+
+
+class _FakeSandbox:
+    """Enough of AsyncSandbox for the executor's callback wiring."""
+
+    chunks: list[str] = []
+    handles: list[_FakeHandle] = []
+    sandbox_id = "sbx-fake"
+
+    def __init__(self):
+        outer = self
+
+        class _Files:
+            async def write(self, path, content):
+                pass
+
+        class _Commands:
+            async def run(self, cmd, **kwargs):
+                handle = _FakeHandle(outer.chunks, kwargs["on_stdout"], kwargs["on_stderr"])
+                outer.handles.append(handle)
+                return handle
+
+        self.files, self.commands = _Files(), _Commands()
+
+    @classmethod
+    async def create(cls, **kwargs):
+        return cls()
+
+    async def kill(self):
+        pass
+
+
+async def test_e2b_executor_keeps_the_cap_and_kills_a_flooding_command(monkeypatch):
+    import app.execution.executor as module
+
+    _FakeSandbox.chunks = ["z" * 1000] * 50
+    _FakeSandbox.handles = []
+    monkeypatch.setattr(module, "AsyncSandbox", _FakeSandbox)
+
+    result = await E2BExecutor("key").run({"runner.py": ""}, "{}", timeout_s=5, output_cap=2500)
+
+    assert result.status == "completed"
+    assert result.stdout == "z" * 2500 + TRUNCATION_MARKER
+    assert result.exit_code == 137
+    assert result.sandbox_id == "sbx-fake"
+    handle = _FakeSandbox.handles[0]
+    assert handle.killed
+
+
+async def test_e2b_executor_passes_bounded_output_through_unchanged(monkeypatch):
+    import app.execution.executor as module
+
+    _FakeSandbox.chunks = ['{"results": []}\n']
+    _FakeSandbox.handles = []
+    monkeypatch.setattr(module, "AsyncSandbox", _FakeSandbox)
+
+    result = await E2BExecutor("key").run({"runner.py": ""}, "{}", timeout_s=5, output_cap=2500)
+
+    assert result.status == "completed"
+    assert result.stdout == '{"results": []}\n'
+    assert result.exit_code == 0
+    assert not _FakeSandbox.handles[0].killed

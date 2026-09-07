@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS test_runs (
     check_version TEXT,
     check_ids_json TEXT,
     input_hash TEXT,
+    inputs_hash TEXT,
     status TEXT,
     results_json TEXT,
     stdout_excerpt TEXT,
@@ -166,6 +167,20 @@ CREATE TABLE IF NOT EXISTS session_events (
     payload_json TEXT,
     PRIMARY KEY(interview_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS session_usage (
+    interview_id TEXT PRIMARY KEY,
+    voice_seconds REAL DEFAULT 0,
+    paused_seconds REAL DEFAULT 0,
+    model_calls INTEGER DEFAULT 0,
+    model_input_tokens INTEGER DEFAULT 0,
+    model_output_tokens INTEGER DEFAULT 0,
+    sandbox_runs INTEGER DEFAULT 0,
+    sandbox_seconds REAL DEFAULT 0,
+    provider_failures INTEGER DEFAULT 0,
+    voice_started_at TEXT,
+    updated_at TEXT
+);
 """
 
 
@@ -177,6 +192,17 @@ def connect(path: str) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after a table first shipped; `CREATE TABLE IF NOT EXISTS` will
+# not add them to an existing database, so they are applied one by one.
+ADDED_COLUMNS = (
+    ("test_runs", "inputs_hash", "TEXT"),
+)
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for table, column, declaration in ADDED_COLUMNS:
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
     conn.commit()

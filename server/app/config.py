@@ -26,8 +26,14 @@ class Settings(BaseSettings):
     EXECUTOR: str = "e2b"
 
     SESSION_SECRET: str = ""
-    # When set, `POST /api/interviews` needs it in `X-Quorum-Access-Key`.
+    # When set, `POST /api/interviews` needs it in the `X-Access-Key` header or
+    # the `access_key` body field. `GET /api/admission` tells the web app so.
     DEMO_ACCESS_KEY: str = ""
+    # Creation quotas, enforced whether or not a key is configured. The hourly
+    # cap is a per-process sliding window, applied per client IP and in total;
+    # the active cap counts interviews not yet finished or deleted.
+    MAX_INTERVIEWS_PER_HOUR: int = 20
+    MAX_ACTIVE_INTERVIEWS: int = 10
 
     DATABASE_PATH: str = "./data/quorum.db"
     SNAPSHOT_DIR: str = "./data/snapshots"
@@ -40,6 +46,8 @@ class Settings(BaseSettings):
     SOURCE_LIMIT_BYTES: int = 102400
     MAX_RUNS_PER_INTERVIEW: int = 20
     SESSION_CAP_MINUTES: int = 30
+    # How often the watchdog finishes live interviews past the cap (A07).
+    SESSION_WATCHDOG_INTERVAL_SECONDS: float = 15.0
 
     SCENARIO_DIR: str = "../scenarios"
     FOLLOW_UP_DELAY_SECONDS: float = 6.0

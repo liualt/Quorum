@@ -252,6 +252,9 @@ class AgoraVoiceService:
             # Nothing downstream can act on this, and an agent nobody stopped
             # hangs up on its own after `idle_timeout`.
             logger.exception("could not stop voice agent %s", agent_id)
+            # Reported, not raised: the caller counts it as a provider failure.
+            return False
+        return True
 
     async def say(self, agent_id: str, text: str, *, interrupt: bool = False) -> None:
         """Speak a line the model endpoint was never asked for.

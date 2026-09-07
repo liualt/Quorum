@@ -18,7 +18,7 @@ from app.execution.runs import run_view
 from app.interview.controller import segment_view
 from app.interview.llm_client import LLMError
 from app.interview.prompts import claims_messages
-from app.storage import repo
+from app.storage import repo, usage
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,8 @@ async def extract_and_store_claims(app, interview_id: str, segment_id: str) -> l
     )
 
     try:
-        payload = await app.state.llm.complete_json(messages)
+        with usage.scope(app, interview_id):
+            payload = await app.state.llm.complete_json(messages)
     except LLMError as error:
         logger.warning("claims for %s: %s", segment_id, error)
         return []

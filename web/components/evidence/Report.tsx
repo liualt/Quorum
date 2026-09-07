@@ -55,6 +55,13 @@ function describeFailure(cause: unknown): LoadFailure {
  */
 const REFRESH_DELAY_MS = 150;
 
+/*
+ * How often to look again for a report that does not exist yet while the
+ * interview is still finishing — a page reloaded during "ending the
+ * interview" lands here before the assessment is stored.
+ */
+const FINISHING_POLL_MS = 1_500;
+
 /**
  * The assessment report: loads the view, keeps it current from the event
  * stream, and owns what is selected and what the drawer shows. Everything
@@ -95,6 +102,29 @@ export function Report({ interviewId }: { interviewId: string }) {
     void load();
     return () => controller.abort();
   }, [interviewId, attempt]);
+
+  // No report yet, but the interview is finishing: it is on its way, so keep
+  // looking rather than leave the candidate on "No report yet" after a reload.
+  // An interview that is still live is not polled; its report is not coming.
+  useEffect(() => {
+    if (failure?.status !== 404) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    (async () => {
+      try {
+        const view = await getInterview(interviewId, controller.signal);
+        if (view.status !== "finishing" && view.status !== "finished") return;
+      } catch (cause) {
+        if (isAbort(cause)) return;
+        // Unreachable for the moment; try the report again anyway.
+      }
+      timer = setTimeout(() => setAttempt((count) => count + 1), FINISHING_POLL_MS);
+    })();
+    return () => {
+      controller.abort();
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [failure, interviewId]);
 
   /** Re-read the report and the runs; the server's state replaces ours. */
   const refresh = useCallback(async () => {

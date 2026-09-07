@@ -64,6 +64,13 @@ def update_interview(conn, id, **fields):
     return _fetch_one(conn, "interviews", id)
 
 
+def count_active_interviews(conn):
+    """Interviews that may still cost something: not yet finished or deleted."""
+    return conn.execute(
+        "SELECT COUNT(*) AS n FROM interviews WHERE status NOT IN ('finished', 'deleted')"
+    ).fetchone()["n"]
+
+
 def list_expired_interviews(conn, now_iso):
     return conn.execute(
         "SELECT * FROM interviews WHERE (expires_at IS NOT NULL AND expires_at <= ?) OR status = 'deleted'",
@@ -190,17 +197,18 @@ def latest_snapshot(conn, interview_id):
 # --- test runs ---------------------------------------------------------
 
 def insert_run(conn, *, id, interview_id, snapshot_id, fixture_version, check_version,
-                check_ids_json, input_hash, status, executor, replay_of=None, idempotency_key=None):
+                check_ids_json, input_hash, status, executor, replay_of=None, idempotency_key=None,
+                inputs_hash=None):
     with _lock:
         conn.execute(
             """
             INSERT INTO test_runs (
                 id, interview_id, snapshot_id, fixture_version, check_version, check_ids_json,
-                input_hash, status, executor, replay_of, idempotency_key, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                input_hash, inputs_hash, status, executor, replay_of, idempotency_key, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (id, interview_id, snapshot_id, fixture_version, check_version, check_ids_json,
-             input_hash, status, executor, replay_of, idempotency_key, ids.now_iso()),
+             input_hash, inputs_hash, status, executor, replay_of, idempotency_key, ids.now_iso()),
         )
         conn.commit()
     return _fetch_one(conn, "test_runs", id)

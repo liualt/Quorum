@@ -230,8 +230,7 @@ def test_startup_expires_what_was_left_behind(settings, scenario):
     with TestClient(app, raise_server_exceptions=True):
         assert repo.get_interview(app.state.db, stale["id"]) is None
         assert repo.get_interview(app.state.db, fresh["id"]) is not None
-        [task] = app.state.periodic_tasks
-        assert task.get_name() == "expiry"
+        [task] = [t for t in app.state.periodic_tasks if t.get_name() == "expiry"]
         assert not task.done()
     assert task.done()
 
@@ -251,8 +250,7 @@ async def test_a_periodic_task_is_never_among_the_awaitable_background_tasks(app
     async with app.router.lifespan_context(app):
         assert all(task.get_name() != "expiry" for task in app.state.background_tasks)
         assert background.pending(app, "expiry") == []
-        [task] = app.state.periodic_tasks
-        assert task.get_name() == "expiry"
+        assert {t.get_name() for t in app.state.periodic_tasks} == {"expiry", "session_watchdog"}
 
 
 def test_created_interviews_carry_the_retention_expiry(client, app, candidate):

@@ -29,7 +29,7 @@ from app.interview.prompts import TurnContext, spoken_turn_messages
 from app.interview.roles import TurnInstruction, select_role
 from app.interview.stages import Facts, next_stage
 from app.interview.state import ControllerState
-from app.storage import repo
+from app.storage import repo, usage
 from app.storage.events import emit
 
 logger = logging.getLogger(__name__)
@@ -277,6 +277,10 @@ class InterviewController:
         pieces: list[str] = []
         status = "complete"
         self._streaming[interview_id] = plan.generation
+        # The model call below is billed to this interview (PRD section 15).
+        usage_token = usage.usage_scope.set(
+            lambda **counts: usage.record(self._db, interview_id, **counts)
+        )
         try:
             try:
                 scrub = IdScrubber()
@@ -312,6 +316,7 @@ class InterviewController:
             self._record_role_segment(plan, "".join(pieces), "interrupted", outcome)
             raise
         finally:
+            usage.usage_scope.reset(usage_token)
             self._end_stream(interview_id, plan.generation)
 
         async with self.interview_lock(interview_id):

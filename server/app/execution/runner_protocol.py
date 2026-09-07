@@ -8,12 +8,12 @@ decides pass or fail: the expectations stay here, in `checks.py`.
 import hashlib
 import json
 
-from app.scenario import Check, Scenario
+from app.scenario import Check
 
 STEP_KEYS = ("op", "user", "query", "document")
 
 
-def build_workspace_files(scenario: Scenario, snapshot_files: dict[str, str]) -> dict[str, str]:
+def build_workspace_files(scenario, snapshot_files: dict[str, str]) -> dict[str, str]:
     """Relative path -> content, laid out the way `runner.py` and `index.py` expect.
 
     Candidate files and `index.py`/`runner.py` sit at the top level; fixtures go
@@ -61,10 +61,18 @@ def parse_output(stdout: str) -> dict:
     raise ValueError(f"no runner result object on stdout: {stdout[-500:]!r}")
 
 
-def input_hash(scenario: Scenario, snapshot_hash: str, check_ids: list[str]) -> str:
-    """Identifies everything a run's outcome depends on, for replay comparison."""
+def input_hash(scenario, snapshot_hash: str, check_ids: list[str],
+               inputs_hash: str | None = None) -> str:
+    """Identifies everything a run's outcome depends on, for replay comparison.
+
+    `inputs_hash` is the content hash of the archived scenario inputs (see
+    `archive.py`); with it, an edit under an unchanged version label changes
+    the hash. `scenario` may be a `Scenario` or archived `RunInputs`.
+    """
     digest = hashlib.sha256()
     parts = (scenario.fixture_version, scenario.check_version, snapshot_hash, *sorted(check_ids))
+    if inputs_hash is not None:
+        parts = (*parts, f"inputs:{inputs_hash}")
     for part in parts:
         digest.update(f"{part}\0".encode())
     return digest.hexdigest()

@@ -123,6 +123,10 @@ export interface InterviewView {
   stage: Stage;
   active_role: Role;
   paused: boolean;
+  /** Paused time banked by the server so far, in milliseconds. */
+  paused_ms: number;
+  /** When the current pause began; null unless `paused`. */
+  paused_at: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -324,6 +328,11 @@ export interface AssessmentView {
 }
 
 /* -------------------------------------------------------- request / response shapes */
+
+/** `GET /api/admission`: what the consent form must collect before creating. */
+export interface AdmissionView {
+  access_key_required: boolean;
+}
 
 export interface CreateInterviewResult {
   id: string;

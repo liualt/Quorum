@@ -25,7 +25,7 @@ from app.interview.controller import segment_view
 from app.interview.llm_client import LLMError
 from app.interview.prompts import DIMENSIONS, PROMPT_VERSION, assessment_messages
 from app.interview.state import ControllerState
-from app.storage import repo
+from app.storage import repo, usage
 from app.storage.events import emit
 
 logger = logging.getLogger(__name__)
@@ -107,12 +107,14 @@ async def _validated_payload(app, interview_id: str, messages: list[dict]) -> di
     """The model's assessment once it validates, after at most one retry; else None."""
     conn = app.state.db
     try:
-        payload = await app.state.llm.complete_json(messages)
+        with usage.scope(app, interview_id):
+            payload = await app.state.llm.complete_json(messages)
         errors = validate_assessment_payload(conn, interview_id, payload)
         if not errors:
             return payload
         logger.warning("assessment for %s rejected, retrying once: %s", interview_id, "; ".join(errors))
-        payload = await app.state.llm.complete_json(_with_errors(messages, errors))
+        with usage.scope(app, interview_id):
+            payload = await app.state.llm.complete_json(_with_errors(messages, errors))
         errors = validate_assessment_payload(conn, interview_id, payload)
         if not errors:
             return payload

@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Protocol
@@ -78,6 +79,79 @@ def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
+class _BoundedOutput:
+    """Collects one output stream, keeping only the first `cap` bytes.
+
+    Everything past the cap is dropped, so a flooding child costs at most
+    `cap` bytes of memory however much it writes. `text()` matches
+    `truncate`: the kept prefix plus the marker whenever anything was dropped.
+    """
+
+    def __init__(self, cap: int):
+        self._cap = cap
+        self._chunks: list[bytes] = []
+        self._size = 0
+        self.truncated = False
+
+    def add(self, chunk: bytes | str) -> None:
+        data = chunk.encode("utf-8", "replace") if isinstance(chunk, str) else chunk
+        room = self._cap - self._size
+        if len(data) > room:
+            self.truncated = True
+            data = data[:max(room, 0)]
+        if data:
+            self._chunks.append(data)
+            self._size += len(data)
+
+    def text(self) -> str:
+        data = b"".join(self._chunks)
+        if not self.truncated:
+            return data.decode("utf-8", "replace")
+        return data.decode("utf-8", "ignore") + TRUNCATION_MARKER
+
+
+def _drain(stream, sink: _BoundedOutput) -> None:
+    """Reader-thread body: consume a pipe to EOF so the child never blocks."""
+    try:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            sink.add(chunk)
+    finally:
+        stream.close()
+
+
+def _feed(stream, script: str) -> None:
+    try:
+        stream.write(script.encode("utf-8"))
+    except OSError:
+        pass  # the child exited without reading; its exit code says so
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+class _ChildHandle:
+    """Lets the asyncio side kill the child that the worker thread owns."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen | None = None
+        self._cancelled = False
+
+    def attach(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self._process = process
+            if self._cancelled:
+                _kill_process_group(process)
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            if self._process is not None and self._process.poll() is None:
+                _kill_process_group(self._process)
+
+
 class LocalExecutor:
     """Development and test executor; not the demo path.
 
@@ -85,14 +159,27 @@ class LocalExecutor:
     it offers no isolation beyond the process boundary. The child gets its own
     session and is killed as a group on timeout, because the runner spawns one
     subprocess per check.
+
+    Output is read incrementally and only the first `output_cap` bytes of each
+    stream are retained; the rest is drained and discarded so a flooding child
+    neither blocks on a full pipe nor grows this process's memory. Cancelling
+    the task that awaits `run` kills the process tree straight away rather
+    than leaving it to the timeout.
     """
 
     name = "local"
 
     async def run(self, files, script, *, timeout_s, output_cap) -> ExecResult:
-        return await asyncio.to_thread(self._run_blocking, files, script, timeout_s, output_cap)
+        child = _ChildHandle()
+        try:
+            return await asyncio.to_thread(
+                self._run_blocking, files, script, timeout_s, output_cap, child
+            )
+        except asyncio.CancelledError:
+            child.cancel()
+            raise
 
-    def _run_blocking(self, files, script, timeout_s, output_cap) -> ExecResult:
+    def _run_blocking(self, files, script, timeout_s, output_cap, child=None) -> ExecResult:
         started = time.monotonic()
         workdir = tempfile.mkdtemp(prefix="quorum-run-")
         try:
@@ -103,9 +190,6 @@ class LocalExecutor:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 env={
                     "PATH": os.environ.get("PATH", ""),
                     "PYTHONDONTWRITEBYTECODE": "1",
@@ -114,8 +198,18 @@ class LocalExecutor:
                 },
                 start_new_session=True,
             )
+            if child is not None:
+                child.attach(process)
+            stdout, stderr = _BoundedOutput(output_cap), _BoundedOutput(output_cap)
+            pumps = [
+                threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+                threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
+                threading.Thread(target=_feed, args=(process.stdin, script), daemon=True),
+            ]
+            for pump in pumps:
+                pump.start()
             try:
-                stdout, stderr = process.communicate(input=script, timeout=timeout_s)
+                process.wait(timeout=timeout_s)
                 # A non-zero exit is still `completed`: the runner ran, and
                 # whether its output is usable is `parse_output`'s call. Same
                 # rule as the E2B path.
@@ -123,12 +217,16 @@ class LocalExecutor:
                 exit_code = process.returncode
             except subprocess.TimeoutExpired:
                 _kill_process_group(process)
-                stdout, stderr = process.communicate()
+                process.wait()
                 status, exit_code = "timeout", None
+            # The pipes reach EOF once every process in the tree is gone, which
+            # is why the timeout path has to kill the whole group first.
+            for pump in pumps:
+                pump.join()
             return ExecResult(
                 status=status,
-                stdout=truncate(stdout, output_cap),
-                stderr=truncate(stderr, output_cap),
+                stdout=_normalize_newlines(stdout.text()),
+                stderr=_normalize_newlines(stderr.text()),
                 exit_code=exit_code,
                 sandbox_id=None,
                 duration_ms=_elapsed_ms(started),
@@ -138,7 +236,14 @@ class LocalExecutor:
 
 
 class E2BExecutor:
-    """Sandboxed executor: one throwaway E2B sandbox per run, no network."""
+    """Sandboxed executor: one throwaway E2B sandbox per run, no network.
+
+    Output arrives through the SDK's stream callbacks and only the first
+    `output_cap` bytes of each stream are kept. The SDK's own command handle
+    also accumulates every chunk, so once a stream passes the cap the command
+    is killed: the result is still `completed` with truncated output and the
+    kill's exit code, and nothing past the cap is ever held in memory.
+    """
 
     name = "e2b"
 
@@ -149,6 +254,7 @@ class E2BExecutor:
         started = time.monotonic()
         sandbox = None
         sandbox_id = None
+        stdout, stderr = _BoundedOutput(output_cap), _BoundedOutput(output_cap)
         try:
             sandbox = await AsyncSandbox.create(
                 timeout=timeout_s + SANDBOX_LIFETIME_MARGIN_SECONDS,
@@ -162,26 +268,58 @@ class E2BExecutor:
                 await sandbox.files.write(f"{SANDBOX_DIR}/{path}", content)
             await sandbox.files.write(f"{SANDBOX_DIR}/{SCRIPT_NAME}", script)
 
+            handle = None
+            killed = False
+
+            async def _flooded() -> None:
+                nonlocal killed
+                if killed or handle is None:
+                    return
+                killed = True
+                try:
+                    await handle.kill()
+                except Exception:  # the command timeout still bounds it
+                    logger.warning("could not kill flooding command in %s", sandbox_id, exc_info=True)
+
+            async def on_stdout(chunk: str) -> None:
+                stdout.add(chunk)
+                if stdout.truncated:
+                    await _flooded()
+
+            async def on_stderr(chunk: str) -> None:
+                stderr.add(chunk)
+                if stderr.truncated:
+                    await _flooded()
+
             # commands.run takes no stdin content, so the script is a file.
-            command = await sandbox.commands.run(
-                f"python3 runner.py < {SCRIPT_NAME}", cwd=SANDBOX_DIR, timeout=timeout_s
+            handle = await sandbox.commands.run(
+                f"python3 runner.py < {SCRIPT_NAME}",
+                cwd=SANDBOX_DIR,
+                timeout=timeout_s,
+                background=True,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
             )
+            try:
+                exit_code = (await handle.wait()).exit_code
+            except CommandExitException as error:
+                exit_code = error.exit_code
             return ExecResult(
                 status="completed",
-                stdout=truncate(command.stdout, output_cap),
-                stderr=truncate(command.stderr, output_cap),
-                exit_code=command.exit_code,
+                stdout=stdout.text(),
+                stderr=stderr.text(),
+                exit_code=exit_code,
                 sandbox_id=sandbox_id,
                 duration_ms=_elapsed_ms(started),
             )
         except Exception as error:
-            status, stdout, stderr, exit_code = classify_sandbox_error(error)
+            status, out, err, exit_code = classify_sandbox_error(error)
             if status == "unavailable":
                 logger.exception("E2B run failed before any results were produced")
             return ExecResult(
                 status=status,
-                stdout=truncate(stdout, output_cap),
-                stderr=truncate(stderr, output_cap),
+                stdout=truncate(out, output_cap),
+                stderr=truncate(err, output_cap),
                 exit_code=exit_code,
                 sandbox_id=sandbox_id,
                 duration_ms=_elapsed_ms(started),
@@ -221,6 +359,11 @@ def build_executor(settings: Settings) -> Executor:
     if settings.EXECUTOR == "e2b":
         return UnavailableExecutor("E2B_API_KEY is not set")
     return UnavailableExecutor(f"unknown executor: {settings.EXECUTOR}")
+
+
+def _normalize_newlines(text: str) -> str:
+    """What the old text-mode pipes did: the child's os.linesep reads as LF."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _write_workspace(workdir: str, files: dict[str, str]) -> None:

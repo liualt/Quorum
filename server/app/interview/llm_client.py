@@ -19,6 +19,7 @@ import openai
 
 from app.config import Settings
 from app.interview import prompts
+from app.storage import usage
 
 
 class LLMError(Exception):
@@ -57,14 +58,17 @@ class OpenAICompatibleClient:
             )
             # An interrupted turn abandons this generator mid-stream, so the
             # connection has to be released on the way out, not at collection.
+            usage.record_in_scope(model_calls=1)
             async with stream:
                 async for chunk in stream:
+                    _record_tokens(getattr(chunk, "usage", None))
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta.content
                     if delta:
                         yield delta
         except (openai.OpenAIError, httpx2.HTTPError) as error:
+            usage.record_in_scope(provider_failures=1)
             raise LLMError(f"streaming completion failed: {error}") from error
 
     async def complete_json(self, messages: list[dict], *, max_tokens: int = 1500) -> dict:
@@ -77,7 +81,10 @@ class OpenAICompatibleClient:
                 response_format={"type": "json_object"},
             )
         except (openai.OpenAIError, httpx2.HTTPError) as error:
+            usage.record_in_scope(provider_failures=1)
             raise LLMError(f"json completion failed: {error}") from error
+        usage.record_in_scope(model_calls=1)
+        _record_tokens(getattr(response, "usage", None))
 
         content = response.choices[0].message.content if response.choices else None
         if not content:
@@ -86,6 +93,16 @@ class OpenAICompatibleClient:
             return json.loads(content)
         except json.JSONDecodeError as error:
             raise LLMError(f"the model returned invalid JSON: {error}") from error
+
+
+def _record_tokens(counts) -> None:
+    """Bank a response's token counts, when the provider reports them, for PRD section 15."""
+    if counts is None:
+        return
+    prompt = getattr(counts, "prompt_tokens", None) or 0
+    completion = getattr(counts, "completion_tokens", None) or 0
+    if prompt or completion:
+        usage.record_in_scope(model_input_tokens=prompt, model_output_tokens=completion)
 
 
 # --- the scripted test double -----------------------------------------------------
@@ -369,12 +386,14 @@ class ScriptedLLM:
         self, messages: list[dict], *, temperature: float = 0.4, max_tokens: int = 220
     ) -> AsyncIterator[str]:
         system = _require_task(messages, prompts.TASK_SPOKEN_TURN)
+        usage.record_in_scope(model_calls=1)
         words = scripted_spoken_turn(system).split(" ")
         for index, word in enumerate(words):
             yield word if index == 0 else f" {word}"
 
     async def complete_json(self, messages: list[dict], *, max_tokens: int = 1500) -> dict:
         task = prompts.read_task(messages)
+        usage.record_in_scope(model_calls=1)
         if task == prompts.TASK_CLAIMS:
             return scripted_claims(_system_text(messages), _user_text(messages))
         if task == prompts.TASK_ASSESSMENT:

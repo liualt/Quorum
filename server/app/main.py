@@ -18,6 +18,7 @@ from app.evidence.links import link_run_to_claims
 from app.execution.executor import build_executor
 from app.execution.runs import recover_interrupted_runs
 from app.interview.agora import build_voice
+from app.interview import watchdog
 from app.interview.controller import InterviewController
 from app.interview.llm_client import build_llm
 from app.routes import assessment, auth, events, files, interviews, llm, runs, turns
@@ -77,6 +78,13 @@ async def lifespan(app: FastAPI):
         cleanup.EXPIRY_INTERVAL_SECONDS,
         "expiry",
     )
+    # Ends live sessions at the cap whether or not another turn arrives (A07).
+    background.spawn_periodic(
+        app,
+        lambda: watchdog.sweep_sessions(app),
+        settings.SESSION_WATCHDOG_INTERVAL_SECONDS,
+        "session_watchdog",
+    )
 
     yield
 
@@ -111,6 +119,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # as a router-level dependency, so no non-GET route can be added without it.
     app.include_router(interviews.router)
     app.include_router(interviews.mutations)
+    app.include_router(interviews.admission)
     app.include_router(files.router)
     app.include_router(files.mutations)
     app.include_router(runs.router)

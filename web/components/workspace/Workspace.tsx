@@ -132,9 +132,11 @@ export function Workspace({ id }: { id: string }) {
         // A reload must show the code the candidate last saved, not the
         // scenario's starting point.
         let editable = view.scenario.editable_files;
+        let contentHash: string | null = null;
         if (view.latest_snapshot_id) {
           const snapshot = await getSnapshot(id, view.latest_snapshot_id, controller.signal);
           editable = { ...editable, ...snapshot.files };
+          contentHash = snapshot.content_hash;
         }
         const existing = view.me === "candidate" ? await listRuns(id, controller.signal) : [];
 
@@ -145,6 +147,7 @@ export function Workspace({ id }: { id: string }) {
         seed({
           files: editable,
           snapshotId: view.latest_snapshot_id,
+          contentHash,
           runs: existing,
           availableCheckIds: view.scenario.checks
             .filter((check) => check.available)
@@ -169,7 +172,7 @@ export function Workspace({ id }: { id: string }) {
     setSegments((prev) => new Map(prev).set(segment.id, segment));
   }, []);
 
-  const { upsertRun, unlockChecks, setSnapshotId } = code;
+  const { upsertRun, unlockChecks, noteSnapshotSaved } = code;
   const onEvent = useCallback(
     (event: SessionEvent) => {
       switch (event.type) {
@@ -184,7 +187,7 @@ export function Workspace({ id }: { id: string }) {
           upsertSegment(event.payload.segment);
           break;
         case "snapshot_saved":
-          setSnapshotId(event.payload.snapshot_id);
+          noteSnapshotSaved(event.payload.snapshot_id, event.payload.content_hash);
           break;
         case "run_started":
         case "run_completed":
@@ -211,7 +214,7 @@ export function Workspace({ id }: { id: string }) {
           break;
       }
     },
-    [id, router, setSnapshotId, unlockChecks, upsertRun, upsertSegment],
+    [id, router, noteSnapshotSaved, unlockChecks, upsertRun, upsertSegment],
   );
 
   // Only once the GET has succeeded: the stream retries forever on a 401.
@@ -393,6 +396,8 @@ export function Workspace({ id }: { id: string }) {
           <SessionTimer
             startedAt={interview.started_at}
             paused={paused}
+            pausedMs={interview.paused_ms}
+            pausedAt={interview.paused_at}
             capMinutes={interview.session_cap_minutes}
           />
           <Button
