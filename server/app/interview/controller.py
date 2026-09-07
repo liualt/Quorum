@@ -261,10 +261,16 @@ class InterviewController:
                         if spoken:
                             pieces.append(spoken)
                             yield spoken
-                tail = scrub.flush()
-                if tail:
-                    pieces.append(tail)
-                    yield tail
+                # A newer turn cancels this one: the scrubber's held-back tail was
+                # never spoken, so it is dropped rather than flushed. Flushing it
+                # here would emit one more chunk after the interruption, which
+                # PRD section 9 forbids (late chunks of a cancelled generation are
+                # discarded).
+                if status != "interrupted":
+                    tail = scrub.flush()
+                    if tail:
+                        pieces.append(tail)
+                        yield tail
             except LLMError as error:
                 logger.warning("turn %s of %s: %s", plan.generation, interview_id, error)
                 status = "pending"
