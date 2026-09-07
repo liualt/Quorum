@@ -9,7 +9,6 @@ import type { ReactNode } from "react";
 import { Captions } from "@/components/interview/Captions";
 import { STAGE_LABELS } from "@/components/interview/labels";
 import { MicControls } from "@/components/interview/MicControls";
-import type { VoiceUiStatus } from "@/components/interview/MicControls";
 import { PreJoin } from "@/components/interview/PreJoin";
 import { RoleLabel } from "@/components/interview/RoleLabel";
 import { ScenarioNotice } from "@/components/interview/ScenarioNotice";
@@ -25,35 +24,20 @@ import {
   getInterview,
   getSnapshot,
   listRuns,
-  reportTranscript,
-  saveFiles,
   sendTurn,
   setPaused as requestPaused,
   startInterview,
-  startRun,
 } from "@/lib/api";
 import { useSessionEvents } from "@/lib/events";
-import type {
-  FileMap,
-  InterviewView,
-  Role,
-  RunView,
-  SegmentView,
-  SessionEvent,
-  Stage,
-} from "@/lib/types";
-import type {
-  AgentActivity,
-  LiveCaption,
-  VoiceControls,
-  VoiceHandlers,
-  VoiceJoin,
-} from "@/lib/voice";
+import type { InterviewView, Role, SegmentView, SessionEvent, Stage } from "@/lib/types";
 
 import { BriefPanel } from "./BriefPanel";
+import { errorMessage } from "./errorMessage";
 import { BRIEF_TAB, EDITOR_PANEL_ID, FileList, tabId } from "./FileList";
 import { ResultsPanel } from "./ResultsPanel";
 import { RunPanel } from "./RunPanel";
+import { useCodeAndRuns } from "./useCodeAndRuns";
+import { useVoiceBridge } from "./useVoiceBridge";
 
 function EditorLoading() {
   return (
@@ -80,18 +64,7 @@ interface Notice {
   unlocked: string[];
 }
 
-/** PRD §9: a bounded retry after an execution failure. */
-const MAX_RETRIES_PER_RUN = 2;
-
-function errorMessage(cause: unknown, fallback: string): string {
-  return cause instanceof ApiError ? cause.detail : fallback;
-}
-
-function union(set: Set<string>, ids: string[]): Set<string> {
-  const next = new Set(set);
-  for (const id of ids) next.add(id);
-  return next;
-}
+const NO_CHECKS: InterviewView["scenario"]["checks"] = [];
 
 /**
  * The candidate's screen, and the owner of everything on it.
@@ -100,6 +73,10 @@ function union(set: Set<string>, ids: string[]): Set<string> {
  * candidate's own actions, and the event stream — and the stream replays the
  * whole history on every (re)connect. So every collection is keyed by record
  * id and every handler is an upsert: seeing an event twice changes nothing.
+ *
+ * The code half lives in `useCodeAndRuns` and the voice half in
+ * `useVoiceBridge`; this component composes them with the session itself
+ * (stage, role, pause, transcript, notices, ending).
  */
 export function Workspace({ id }: { id: string }) {
   const router = useRouter();
@@ -110,42 +87,39 @@ export function Workspace({ id }: { id: string }) {
   const [stage, setStage] = useState<Stage>("briefing");
   const [role, setRole] = useState<Role>("technical");
   const [paused, setPaused] = useState(false);
-
-  /* ----------------------------------------------------------------- code */
-  const [files, setFiles] = useState<FileMap>({});
-  const [savedFiles, setSavedFiles] = useState<FileMap>({});
-  const [snapshotId, setSnapshotId] = useState<string | null>(null);
   const [selectedTab, setSelectedTab] = useState<string>(BRIEF_TAB);
-  const [saving, setSaving] = useState(false);
-  const [runs, setRuns] = useState<Map<string, RunView>>(() => new Map());
-  const [selectedChecks, setSelectedChecks] = useState<Set<string>>(() => new Set());
-  const [unlockedChecks, setUnlockedChecks] = useState<Set<string>>(() => new Set());
-  const [retries, setRetries] = useState<Map<string, number>>(() => new Map());
-  const [actionStatus, setActionStatus] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
 
   /* --------------------------------------------------------- conversation */
   const [segments, setSegments] = useState<Map<string, SegmentView>>(() => new Map());
   const [notice, setNotice] = useState<Notice | null>(null);
   const dismissedNotices = useRef(new Set<string>());
 
-  /* ---------------------------------------------------------------- voice */
-  const [join, setJoin] = useState<VoiceJoin | null>(null);
-  const [voiceUi, setVoiceUi] = useState<VoiceUiStatus>("text");
-  const [voiceNote, setVoiceNote] = useState<string | null>(null);
-  const [muted, setMuted] = useState(false);
-  const [agentActivity, setAgentActivity] = useState<AgentActivity | null>(null);
-  const [liveCaptions, setLiveCaptions] = useState<LiveCaption[]>([]);
-  const [reconnecting, setReconnecting] = useState(false);
-  const voiceRef = useRef<VoiceControls | null>(null);
-
   /* ------------------------------------------------------------ lifecycle */
   const [startError, setStartError] = useState<string | null>(null);
   const [finishError, setFinishError] = useState<string | null>(null);
   const endDialog = useRef<HTMLDialogElement>(null);
 
+  const code = useCodeAndRuns(id, interview?.scenario.checks ?? NO_CHECKS, phase === "live");
+  const { setError: reportError } = code;
+
+  const updatePaused = useCallback(
+    async (next: boolean) => {
+      setPaused(next);
+      try {
+        await requestPaused(id, next);
+      } catch (cause) {
+        setPaused(!next);
+        reportError(errorMessage(cause, "Could not change the pause state."));
+      }
+    },
+    [id, reportError],
+  );
+
+  const voice = useVoiceBridge(id, updatePaused);
+
   /* ------------------------------------------------------------- loading */
 
+  const { seed } = code;
   useEffect(() => {
     const controller = new AbortController();
     (async () => {
@@ -168,13 +142,14 @@ export function Workspace({ id }: { id: string }) {
         setStage(view.stage);
         setRole(view.active_role);
         setPaused(view.paused);
-        setFiles(editable);
-        setSavedFiles(editable);
-        setSnapshotId(view.latest_snapshot_id);
-        setSelectedChecks(
-          new Set(view.scenario.checks.filter((check) => check.available).map((c) => c.id)),
-        );
-        setRuns(new Map(existing.map((run) => [run.id, run])));
+        seed({
+          files: editable,
+          snapshotId: view.latest_snapshot_id,
+          runs: existing,
+          availableCheckIds: view.scenario.checks
+            .filter((check) => check.available)
+            .map((check) => check.id),
+        });
         setPhase("prejoin");
       } catch (cause) {
         if (cause instanceof DOMException && cause.name === "AbortError") return;
@@ -186,7 +161,7 @@ export function Workspace({ id }: { id: string }) {
       }
     })();
     return () => controller.abort();
-  }, [id, router]);
+  }, [id, router, seed]);
 
   /* --------------------------------------------------------------- events */
 
@@ -194,10 +169,7 @@ export function Workspace({ id }: { id: string }) {
     setSegments((prev) => new Map(prev).set(segment.id, segment));
   }, []);
 
-  const upsertRun = useCallback((run: RunView) => {
-    setRuns((prev) => new Map(prev).set(run.id, run));
-  }, []);
-
+  const { upsertRun, unlockChecks, setSnapshotId } = code;
   const onEvent = useCallback(
     (event: SessionEvent) => {
       switch (event.type) {
@@ -223,8 +195,7 @@ export function Workspace({ id }: { id: string }) {
           break;
         case "scenario_notice": {
           const { segment_id, text, checks_unlocked } = event.payload;
-          setUnlockedChecks((prev) => union(prev, checks_unlocked));
-          setSelectedChecks((prev) => union(prev, checks_unlocked));
+          unlockChecks(checks_unlocked);
           if (!dismissedNotices.current.has(segment_id)) {
             setNotice({ segmentId: segment_id, text, unlocked: checks_unlocked });
           }
@@ -240,7 +211,7 @@ export function Workspace({ id }: { id: string }) {
           break;
       }
     },
-    [id, router, upsertRun, upsertSegment],
+    [id, router, setSnapshotId, unlockChecks, upsertRun, upsertSegment],
   );
 
   // Only once the GET has succeeded: the stream retries forever on a 401.
@@ -256,28 +227,6 @@ export function Workspace({ id }: { id: string }) {
     () => (interview ? Object.keys(interview.scenario.readonly_files) : []),
     [interview],
   );
-  const checks = useMemo(
-    () =>
-      interview
-        ? interview.scenario.checks.map((check) =>
-            check.available || unlockedChecks.has(check.id)
-              ? { ...check, available: true }
-              : check,
-          )
-        : [],
-    [interview, unlockedChecks],
-  );
-  const dirtyFiles = useMemo(
-    () => new Set(editableNames.filter((name) => files[name] !== savedFiles[name])),
-    [editableNames, files, savedFiles],
-  );
-  const dirty = dirtyFiles.size > 0;
-  const runList = useMemo(
-    () =>
-      Array.from(runs.values()).sort((a, b) => b.created_at.localeCompare(a.created_at)),
-    [runs],
-  );
-  const runActive = runList.some((run) => run.status === "queued" || run.status === "running");
   // A segment's seq is its place in the conversation. Event order is not:
   // the candidate's line and the panel's reply are emitted as their own
   // records, and an update to an older segment arrives after newer ones.
@@ -289,27 +238,15 @@ export function Workspace({ id }: { id: string }) {
 
   /* -------------------------------------------------------------- actions */
 
+  const { applyJoin, trySend, drop: dropVoice } = voice;
+
   const start = useCallback(
     async (withVoice: boolean) => {
       setPhase("starting");
       setStartError(null);
       try {
-        const { voice } = await startInterview(id);
-        if (withVoice && voice.enabled) {
-          setJoin(voice);
-          setVoiceUi("connecting");
-          setVoiceNote(null);
-        } else {
-          setJoin(null);
-          setVoiceUi("text");
-          setVoiceNote(
-            !withVoice || voice.enabled
-              ? null
-              : voice.reason
-                ? `Voice could not start: ${voice.reason}. Continuing in text.`
-                : "Voice is not available on this server. Continuing in text.",
-          );
-        }
+        const { voice: join } = await startInterview(id);
+        applyJoin(join, withVoice);
         // The server set `started_at`; the timer needs it.
         setInterview(await getInterview(id));
         setPhase("live");
@@ -318,93 +255,12 @@ export function Workspace({ id }: { id: string }) {
         setPhase("prejoin");
       }
     },
-    [id],
+    [applyJoin, id],
   );
-
-  const updatePaused = useCallback(
-    async (next: boolean) => {
-      setPaused(next);
-      try {
-        await requestPaused(id, next);
-      } catch (cause) {
-        setPaused(!next);
-        setActionError(errorMessage(cause, "Could not change the pause state."));
-      }
-    },
-    [id],
-  );
-
-  const voiceHandlers = useMemo<VoiceHandlers>(
-    () => ({
-      onConnection: (status) => {
-        setVoiceUi(status);
-        if (status === "disconnected") {
-          setLiveCaptions([]);
-          setAgentActivity(null);
-          // PRD §9: a lost voice connection pauses the interview.
-          void updatePaused(true);
-        }
-      },
-      onCaptions: setLiveCaptions,
-      onAgentTurn: ({ turnId, text, status }) => {
-        reportTranscript(id, "agent", status, text, turnId).catch(() => {
-          // The segment already exists from the model endpoint; a missed
-          // spoken-text update leaves the written text, which is still true.
-        });
-      },
-      onAgentActivity: setAgentActivity,
-      onError: setVoiceNote,
-    }),
-    [id, updatePaused],
-  );
-
-  const onVoiceControls = useCallback((controls: VoiceControls | null) => {
-    voiceRef.current = controls;
-  }, []);
-
-  const dropVoice = useCallback(() => {
-    setJoin(null);
-    setVoiceUi("text");
-    setLiveCaptions([]);
-    setAgentActivity(null);
-  }, []);
-
-  const reconnect = useCallback(async () => {
-    setReconnecting(true);
-    setJoin(null);
-    setVoiceNote(null);
-    try {
-      const { voice } = await startInterview(id);
-      if (voice.enabled) {
-        setJoin(voice);
-        setVoiceUi("connecting");
-      } else {
-        dropVoice();
-        setVoiceNote(
-          voice.reason
-            ? `Voice could not reconnect: ${voice.reason}. Continuing in text.`
-            : "Voice could not reconnect. Continuing in text.",
-        );
-      }
-      await updatePaused(false);
-    } catch (cause) {
-      setVoiceNote(errorMessage(cause, "Could not reconnect. Try again, or continue with text."));
-    } finally {
-      setReconnecting(false);
-    }
-  }, [dropVoice, id, updatePaused]);
-
-  const continueWithText = useCallback(async () => {
-    dropVoice();
-    await updatePaused(false);
-  }, [dropVoice, updatePaused]);
 
   const send = useCallback(
     async (text: string) => {
-      if (voiceUi === "connected" && voiceRef.current) {
-        await voiceRef.current.sendText(text);
-        return;
-      }
+      if (await trySend(text)) return;
       let reply;
       try {
         reply = await sendTurn(id, text);
@@ -417,68 +273,8 @@ export function Workspace({ id }: { id: string }) {
       setStage(reply.stage);
       setRole(reply.role);
     },
-    [id, voiceUi],
+    [id, trySend],
   );
-
-  const save = useCallback(async () => {
-    if (!dirty || saving || phase !== "live") return;
-    const snapshot = { ...files };
-    setSaving(true);
-    setActionError(null);
-    try {
-      const saved = await saveFiles(id, snapshot);
-      setSavedFiles(snapshot);
-      setSnapshotId(saved.snapshot_id);
-      setActionStatus(`Saved snapshot ${saved.snapshot_id}`);
-    } catch (cause) {
-      setActionError(errorMessage(cause, "Could not save. Try again."));
-    } finally {
-      setSaving(false);
-    }
-  }, [dirty, files, id, phase, saving]);
-
-  const launchRun = useCallback(
-    async (snapshot: string, checkIds: string[]) => {
-      setActionError(null);
-      try {
-        const run = await startRun(id, snapshot, checkIds, crypto.randomUUID());
-        upsertRun(run);
-        setActionStatus(`Run ${run.id} queued on snapshot ${snapshot}`);
-      } catch (cause) {
-        setActionError(errorMessage(cause, "Could not start the run. Try again."));
-      }
-    },
-    [id, upsertRun],
-  );
-
-  const run = useCallback(() => {
-    if (!snapshotId) return;
-    // Scenario order, so the same selection always produces the same request.
-    const ids = checks.filter((check) => selectedChecks.has(check.id)).map((c) => c.id);
-    void launchRun(snapshotId, ids);
-  }, [checks, launchRun, selectedChecks, snapshotId]);
-
-  const retry = useCallback(
-    (failed: RunView) => {
-      setRetries((prev) => new Map(prev).set(failed.id, (prev.get(failed.id) ?? 0) + 1));
-      void launchRun(failed.snapshot_id, failed.check_ids);
-    },
-    [launchRun],
-  );
-
-  const retriesLeft = useCallback(
-    (target: RunView) => Math.max(0, MAX_RETRIES_PER_RUN - (retries.get(target.id) ?? 0)),
-    [retries],
-  );
-
-  const toggleCheck = useCallback((checkId: string) => {
-    setSelectedChecks((prev) => {
-      const next = new Set(prev);
-      if (next.has(checkId)) next.delete(checkId);
-      else next.add(checkId);
-      return next;
-    });
-  }, []);
 
   const finish = useCallback(async () => {
     endDialog.current?.close();
@@ -498,6 +294,7 @@ export function Workspace({ id }: { id: string }) {
 
   /* ------------------------------------------------------------- effects */
 
+  const { save, dirty } = code;
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
@@ -565,7 +362,7 @@ export function Workspace({ id }: { id: string }) {
   const finishing = phase === "finishing";
   const editableSelected = editableNames.includes(selectedTab);
   const selectedContent = editableSelected
-    ? (files[selectedTab] ?? "")
+    ? (code.files[selectedTab] ?? "")
     : (interview.scenario.readonly_files[selectedTab] ?? "");
   const inputBlocked = finishing
     ? "The interview is ending."
@@ -574,9 +371,9 @@ export function Workspace({ id }: { id: string }) {
       : null;
   const retryBlocked = finishing
     ? "The interview is ending."
-    : runActive
+    : code.runActive
       ? "A run is in progress."
-      : runs.size >= runLimit
+      : code.runsUsed >= runLimit
         ? `All ${runLimit} runs have been used.`
         : null;
 
@@ -622,7 +419,7 @@ export function Workspace({ id }: { id: string }) {
         <ScenarioNotice
           text={notice.text}
           unlockedChecks={notice.unlocked.map(
-            (checkId) => checks.find((check) => check.id === checkId)?.name ?? checkId,
+            (checkId) => code.checks.find((check) => check.id === checkId)?.name ?? checkId,
           )}
           onDismiss={() => {
             dismissedNotices.current.add(notice.segmentId);
@@ -656,7 +453,7 @@ export function Workspace({ id }: { id: string }) {
                 editable={editableNames}
                 readonly={readonlyNames}
                 selected={selectedTab}
-                dirty={dirtyFiles}
+                dirty={code.dirtyFiles}
                 onSelect={setSelectedTab}
               />
               <div
@@ -675,8 +472,7 @@ export function Workspace({ id }: { id: string }) {
                     readOnly={!editableSelected || finishing}
                     ariaLabel={editableSelected ? selectedTab : `${selectedTab} (read only)`}
                     onChange={(value) => {
-                      if (!editableSelected) return;
-                      setFiles((prev) => ({ ...prev, [selectedTab]: value }));
+                      if (editableSelected) code.setFile(selectedTab, value);
                     }}
                   />
                 )}
@@ -685,19 +481,19 @@ export function Workspace({ id }: { id: string }) {
           </Panel>
 
           <RunPanel
-            checks={checks}
-            selected={selectedChecks}
-            onToggleCheck={toggleCheck}
-            dirty={dirty}
-            saving={saving}
-            onSave={() => void save()}
-            snapshotId={snapshotId}
-            runActive={runActive}
-            runsUsed={runs.size}
+            checks={code.checks}
+            selected={code.selectedChecks}
+            onToggleCheck={code.toggleCheck}
+            dirty={code.dirty}
+            saving={code.saving}
+            onSave={() => void code.save()}
+            snapshotId={code.snapshotId}
+            runActive={code.runActive}
+            runsUsed={code.runsUsed}
             runLimit={runLimit}
-            onRun={run}
-            status={actionStatus}
-            error={actionError}
+            onRun={code.run}
+            status={code.status}
+            error={code.error}
             disabled={finishing}
           />
         </div>
@@ -705,24 +501,24 @@ export function Workspace({ id }: { id: string }) {
         <div className="flex min-w-0 flex-col gap-3">
           <Captions
             segments={segmentList}
-            live={liveCaptions}
+            live={voice.liveCaptions}
             candidateName={interview.display_name}
           />
           <Panel>
             <div className="grid gap-4">
               <MicControls
-                voice={voiceUi}
-                note={voiceNote}
-                agentActivity={agentActivity}
-                muted={muted}
+                voice={voice.status}
+                note={voice.note}
+                agentActivity={voice.agentActivity}
+                muted={voice.muted}
                 paused={paused}
-                onToggleMute={() => setMuted((value) => !value)}
-                onReconnect={() => void reconnect()}
-                onContinueWithText={() => void continueWithText()}
-                busy={reconnecting}
+                onToggleMute={voice.toggleMute}
+                onReconnect={() => void voice.reconnect()}
+                onContinueWithText={() => void voice.continueWithText()}
+                busy={voice.reconnecting}
               />
               <TextInput
-                mode={voiceUi === "connected" ? "voice" : "text"}
+                mode={voice.status === "connected" ? "voice" : "text"}
                 blocked={inputBlocked}
                 onSend={send}
               />
@@ -732,22 +528,22 @@ export function Workspace({ id }: { id: string }) {
 
         <div className="min-w-0 lg:col-span-2">
           <ResultsPanel
-            runs={runList}
-            checks={checks}
-            onRetry={retry}
-            retriesLeft={retriesLeft}
+            runs={code.runList}
+            checks={code.checks}
+            onRetry={code.retry}
+            retriesLeft={code.retriesLeft}
             retryBlocked={retryBlocked}
           />
         </div>
       </main>
 
-      {join ? (
+      {voice.join ? (
         <VoicePanel
-          key={join.token}
-          join={join}
-          muted={muted || paused}
-          handlers={voiceHandlers}
-          onControls={onVoiceControls}
+          key={voice.join.token}
+          join={voice.join}
+          muted={voice.muted || paused}
+          handlers={voice.handlers}
+          onControls={voice.onControls}
         />
       ) : null}
 

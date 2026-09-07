@@ -26,7 +26,10 @@ const KIND_LABELS: Partial<Record<SegmentKind, string>> = {
 const NEAR_BOTTOM_PX = 48;
 
 function timeOf(iso: string): string {
-  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return new Date(iso).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 /**
@@ -50,39 +53,50 @@ export function Captions({ segments, live, candidateName }: CaptionsProps) {
   const onScroll = () => {
     const el = scroller.current;
     if (!el) return;
-    nearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+    nearBottom.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
   };
 
   return (
     <Panel title="Captions" padded={false}>
-      <div ref={scroller} onScroll={onScroll} className="h-72 overflow-y-auto lg:h-[26rem]">
-        <ol role="log" aria-live="polite" aria-relevant="additions text" className="divide-border divide-y">
-          {segments.length === 0 ? (
-            <li className="text-muted-foreground px-4 py-6 text-sm">
-              The panel&apos;s greeting will appear here once you join.
-            </li>
-          ) : null}
-          {segments.map((segment) => (
-            <li key={segment.id} className="grid gap-1 px-4 py-3">
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <Speaker segment={segment} candidateName={candidateName} />
-                {KIND_LABELS[segment.kind] ? <Chip>{KIND_LABELS[segment.kind]}</Chip> : null}
-                {segment.status === "interrupted" ? (
-                  <Chip tone="caution">Interrupted</Chip>
-                ) : null}
-                <time
-                  dateTime={segment.created_at}
-                  className="text-muted-foreground ml-auto font-mono"
-                >
-                  {timeOf(segment.created_at)}
-                </time>
-              </div>
-              <p className="text-sm whitespace-pre-wrap">
-                {segment.spoken_text ?? segment.text}
-              </p>
-            </li>
-          ))}
-        </ol>
+      <div
+        ref={scroller}
+        onScroll={onScroll}
+        className="h-72 overflow-y-auto lg:h-[26rem]"
+      >
+        {/* The live region wraps the list rather than being it, so the list
+            keeps its list semantics. */}
+        <div role="log" aria-live="polite" aria-relevant="additions text">
+          <ol className="divide-border divide-y">
+            {segments.length === 0 ? (
+              <li className="text-muted-foreground px-4 py-6 text-sm">
+                The panel&apos;s greeting will appear here once you join.
+              </li>
+            ) : null}
+            {segments.map((segment) => (
+              <li key={segment.id} className="grid gap-1 px-4 py-3">
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <Speaker segment={segment} candidateName={candidateName} />
+                  {KIND_LABELS[segment.kind] ? (
+                    <Chip>{KIND_LABELS[segment.kind]}</Chip>
+                  ) : null}
+                  {segment.status === "interrupted" ? (
+                    <Chip tone="caution">Interrupted</Chip>
+                  ) : null}
+                  <time
+                    dateTime={segment.created_at}
+                    className="text-muted-foreground ml-auto font-mono"
+                  >
+                    {timeOf(segment.created_at)}
+                  </time>
+                </div>
+                <p className="text-sm whitespace-pre-wrap">
+                  {segment.spoken_text ?? segment.text}
+                </p>
+              </li>
+            ))}
+          </ol>
+        </div>
         {live.length > 0 ? (
           <div aria-hidden className="border-border border-t px-4 py-3">
             {live.map((caption) => (
@@ -103,7 +117,13 @@ export function Captions({ segments, live, candidateName }: CaptionsProps) {
   );
 }
 
-function Speaker({ segment, candidateName }: { segment: SegmentView; candidateName: string }) {
+function Speaker({
+  segment,
+  candidateName,
+}: {
+  segment: SegmentView;
+  candidateName: string;
+}) {
   if (isRole(segment.speaker)) return <RoleLabel role={segment.speaker} />;
   return (
     <span className="font-mono text-sm font-semibold">

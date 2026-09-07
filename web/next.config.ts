@@ -9,7 +9,9 @@ const backendUrl = process.env.BACKEND_URL ?? "http://localhost:8000";
 const nextConfig: NextConfig = {
   // The proxied event stream must not be gzipped: the compressor holds each
   // small SSE frame back until its buffer fills, so the browser sees nothing
-  // until the connection closes. Compression belongs at the edge, not here.
+  // until the connection closes. Interim: the backend will send
+  // `Cache-Control: no-transform` on its SSE routes, which the compressor
+  // honours, and then this returns to the default.
   compress: false,
   async rewrites() {
     return [

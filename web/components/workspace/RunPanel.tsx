@@ -32,9 +32,11 @@ interface RunPanelProps {
 /** The first thing stopping a run, phrased for the candidate. */
 function runBlockedBy(props: RunPanelProps): string | null {
   if (props.disabled) return "The interview is ending.";
-  if (props.dirty || !props.snapshotId) return "Save first; a run always uses a saved snapshot.";
+  if (props.dirty) return "Save first; a run always uses a saved snapshot.";
+  if (!props.snapshotId) return "Save the starter code to run it.";
   if (props.runActive) return "A run is in progress.";
-  if (props.runsUsed >= props.runLimit) return `All ${props.runLimit} runs have been used.`;
+  if (props.runsUsed >= props.runLimit)
+    return `All ${props.runLimit} runs have been used.`;
   if (props.selected.size === 0) return "Select at least one check.";
   return null;
 }
@@ -61,18 +63,30 @@ export function RunPanel(props: RunPanelProps) {
   } = props;
   const runHintId = useId();
   const blocked = runBlockedBy(props);
+  // The starter code counts as unsaved: a run needs a snapshot, and there is none yet.
+  const needsSave = dirty || snapshotId === null;
 
   return (
     <Panel
       title="Save and run"
       actions={
         dirty ? (
-          <Chip tone="caution" icon={<Circle size={10} weight="fill" aria-hidden />}>
+          <Chip
+            tone="caution"
+            icon={<Circle size={10} weight="fill" aria-hidden />}
+          >
             Unsaved changes
           </Chip>
-        ) : (
+        ) : snapshotId ? (
           <Chip tone="neutral" icon={<Check size={12} aria-hidden />}>
-            {snapshotId ? "All changes saved" : "Nothing saved yet"}
+            All changes saved
+          </Chip>
+        ) : (
+          <Chip
+            tone="caution"
+            icon={<Circle size={10} weight="fill" aria-hidden />}
+          >
+            Nothing saved yet
           </Chip>
         )
       }
@@ -101,9 +115,13 @@ export function RunPanel(props: RunPanelProps) {
                 <span className="min-w-0">
                   <span className="font-medium">{check.name}</span>
                   {!available ? (
-                    <Chip className="ml-2 align-middle">not yet introduced</Chip>
+                    <Chip className="ml-2 align-middle">
+                      not yet introduced
+                    </Chip>
                   ) : null}
-                  <span className="text-muted-foreground block">{check.description}</span>
+                  <span className="text-muted-foreground block">
+                    {check.description}
+                  </span>
                 </span>
               </label>
             );
@@ -111,7 +129,11 @@ export function RunPanel(props: RunPanelProps) {
         </fieldset>
 
         <div className="flex flex-wrap items-center gap-3">
-          <Button variant="secondary" onClick={onSave} disabled={!dirty || saving || disabled}>
+          <Button
+            variant="secondary"
+            onClick={onSave}
+            disabled={!needsSave || saving || disabled}
+          >
             <FloppyDisk size={18} aria-hidden />
             {saving ? "Saving…" : "Save"}
           </Button>
@@ -125,7 +147,9 @@ export function RunPanel(props: RunPanelProps) {
             {snapshotId ? (
               <>
                 Run saved snapshot{" "}
-                <code className="font-mono font-normal">{shortSnapshot(snapshotId)}</code>
+                <code className="font-mono font-normal">
+                  {shortSnapshot(snapshotId)}
+                </code>
               </>
             ) : (
               "Run checks"
@@ -136,7 +160,10 @@ export function RunPanel(props: RunPanelProps) {
           </p>
         </div>
 
-        <p role="status" className="text-muted-foreground min-h-5 font-mono text-xs">
+        <p
+          role="status"
+          className="text-muted-foreground min-h-5 font-mono text-xs"
+        >
           {status ?? (snapshotId ? `Latest snapshot ${snapshotId}` : "")}
         </p>
         {error ? <ErrorText>{error}</ErrorText> : null}
