@@ -1,0 +1,442 @@
+"""The voice service and the `/start` wiring that uses it.
+
+Nothing here reaches Agora. The service is built with credentials shaped the way
+Agora demands but signed by nobody, so the token minting and the wire config are
+exercised locally, and a fake session stands in wherever a real one would speak
+to the network.
+"""
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.config import Settings
+from app.interview import prompts
+from app.interview.agora import (
+    AgoraVoiceService,
+    JoinData,
+    NullVoiceService,
+    build_voice,
+)
+from app.main import create_app
+from app.routes.deps import llm_token
+from app.storage import repo
+from tests.conftest import ORIGIN, create_interview
+
+# Agora refuses any credential that is not exactly 32 characters, dummy or not.
+APP_ID = "a" * 32
+APP_CERTIFICATE = "c" * 32
+
+PUBLIC_BASE_URL = "https://quorum.example"
+LLM_SECRET = "llm-secret"
+
+
+def agora_settings(**overrides) -> Settings:
+    return Settings(
+        **{
+            "AGORA_APP_ID": APP_ID,
+            "AGORA_APP_CERTIFICATE": APP_CERTIFICATE,
+            "CUSTOM_LLM_PUBLIC_BASE_URL": PUBLIC_BASE_URL,
+            "CUSTOM_LLM_AUTH_SECRET": LLM_SECRET,
+            **overrides,
+        }
+    )
+
+
+class FakeSession:
+    """Stands in for an `AsyncAgentSession`; records what was asked of it."""
+
+    def __init__(self, agent_id: str = "agent-abc"):
+        self.agent_id = agent_id
+        self.calls: list[tuple] = []
+
+    async def start(self) -> str:
+        self.calls.append(("start",))
+        return self.agent_id
+
+    async def stop(self) -> None:
+        self.calls.append(("stop",))
+
+    async def say(self, text, priority=None, interruptable=None) -> None:
+        self.calls.append(("say", text, priority, interruptable))
+
+    async def interrupt(self) -> None:
+        self.calls.append(("interrupt",))
+
+
+class FakeClient:
+    """Stands in for `AsyncAgora`; records the agents it was asked to stop."""
+
+    def __init__(self, *, fails: bool = False):
+        self.fails = fails
+        self.stopped: list[str] = []
+
+    async def stop_agent(self, agent_id: str) -> None:
+        self.stopped.append(agent_id)
+        if self.fails:
+            raise RuntimeError("agora is unreachable")
+
+
+def fake_voice(session: FakeSession | None = None, client=None) -> AgoraVoiceService:
+    """A service with neither a real session nor a real client behind it."""
+    session = session or FakeSession()
+    return AgoraVoiceService(
+        agora_settings(),
+        client=client or FakeClient(),
+        session_factory=lambda agent, join: session,
+    )
+
+
+def start_kwargs(**overrides) -> dict:
+    return {
+        "llm_url": f"{PUBLIC_BASE_URL}/llm/itv_1/chat/completions",
+        "llm_token": "bearer-token",
+        "greeting": "Hello Ada, you are speaking with three AI interviewers.",
+        "instructions": "You are the panel.",
+        **overrides,
+    }
+
+
+# --- build_voice ----------------------------------------------------------
+
+def test_build_voice_is_null_without_agora_credentials(settings):
+    assert isinstance(build_voice(settings), NullVoiceService)
+
+
+def test_build_voice_is_null_without_a_public_url_for_the_model_endpoint():
+    settings = agora_settings(CUSTOM_LLM_PUBLIC_BASE_URL="")
+
+    assert isinstance(build_voice(settings), NullVoiceService)
+
+
+def test_build_voice_is_agora_when_both_ends_are_configured():
+    assert isinstance(build_voice(agora_settings()), AgoraVoiceService)
+
+
+def test_the_null_service_is_disabled_and_joins_nothing():
+    voice = NullVoiceService()
+
+    assert voice.enabled is False
+    assert voice.make_join("itv_1") == JoinData(enabled=False)
+
+
+# --- join data ------------------------------------------------------------
+
+def test_make_join_mints_a_channel_and_token_for_the_interview():
+    join = fake_voice().make_join("itv_1")
+
+    assert join.enabled is True
+    assert join.app_id == APP_ID
+    assert join.channel == "quorum-itv_1"
+    assert join.token.startswith("007")
+    assert len(join.token) > 100
+    # The candidate and the agent are two different publishers in one channel.
+    assert 1_000 <= join.uid <= 9_999_999
+    assert 10_000_000 <= join.agent_uid <= 99_999_999
+    assert join.agent_id == ""
+
+
+# --- the wire config ------------------------------------------------------
+
+def test_build_properties_points_the_agent_at_this_backend():
+    voice = AgoraVoiceService(agora_settings())
+    join = voice.make_join("itv_1")
+
+    properties = voice.build_properties(join, **start_kwargs())
+
+    assert properties["channel"] == "quorum-itv_1"
+    assert properties["agent_rtc_uid"] == str(join.agent_uid)
+    assert properties["remote_rtc_uids"] == [str(join.uid)]
+    assert properties["llm"]["url"] == f"{PUBLIC_BASE_URL}/llm/itv_1/chat/completions"
+    assert properties["llm"]["api_key"] == "bearer-token"
+    assert properties["llm"]["vendor"] == "custom"
+    assert properties["llm"]["params"]["model"] == "quorum-controller"
+    assert properties["asr"]["vendor"] == "deepgram"
+    assert properties["tts"]["vendor"] == "minimax"
+    assert properties["advanced_features"]["enable_rtm"] is True
+    assert properties["parameters"]["data_channel"] == "rtm"
+    assert properties["interruption"]["enable"] is True
+
+
+def test_build_properties_makes_agora_speak_the_opening_line():
+    """The endpoint rejects an empty transcript, so the greeting is Agora's job."""
+    voice = AgoraVoiceService(agora_settings())
+    kwargs = start_kwargs()
+
+    properties = voice.build_properties(voice.make_join("itv_1"), **kwargs)
+
+    assert properties["llm"]["greeting_message"] == kwargs["greeting"]
+    assert properties["llm"]["system_messages"] == [
+        {"role": "system", "content": kwargs["instructions"]}
+    ]
+
+
+# --- the session ----------------------------------------------------------
+
+async def test_start_agent_returns_the_agent_id_and_keeps_the_session():
+    session = FakeSession()
+    voice = fake_voice(session)
+
+    agent_id = await voice.start_agent(voice.make_join("itv_1"), **start_kwargs())
+
+    assert agent_id == "agent-abc"
+    assert session.calls == [("start",)]
+
+
+async def test_say_appends_by_default_and_interrupts_when_asked():
+    session = FakeSession()
+    voice = fake_voice(session)
+    agent_id = await voice.start_agent(voice.make_join("itv_1"), **start_kwargs())
+
+    await voice.say(agent_id, "One more thing.")
+    await voice.say(agent_id, "Hold on.", interrupt=True)
+
+    assert session.calls[1:] == [
+        ("say", "One more thing.", "APPEND", True),
+        ("say", "Hold on.", "INTERRUPT", True),
+    ]
+
+
+async def test_interrupt_stops_the_agent_mid_sentence():
+    session = FakeSession()
+    voice = fake_voice(session)
+    agent_id = await voice.start_agent(voice.make_join("itv_1"), **start_kwargs())
+
+    await voice.interrupt(agent_id)
+
+    assert session.calls[1:] == [("interrupt",)]
+
+
+async def test_speaking_to_an_unknown_agent_is_a_warning_not_a_failure(caplog):
+    voice = fake_voice()
+
+    with caplog.at_level("WARNING"):
+        await voice.say("agent-from-a-previous-process", "Hello?")
+        await voice.interrupt("agent-from-a-previous-process")
+
+    assert len(caplog.records) == 2
+    assert "agent-from-a-previous-process" in caplog.text
+
+
+async def test_stop_agent_stops_the_session_it_started():
+    session = FakeSession()
+    client = FakeClient()
+    voice = fake_voice(session, client=client)
+    agent_id = await voice.start_agent(voice.make_join("itv_1"), **start_kwargs())
+
+    await voice.stop_agent(agent_id)
+
+    assert session.calls[1:] == [("stop",)]
+    assert client.stopped == []
+
+
+async def test_stop_agent_asks_agora_directly_for_an_agent_it_does_not_hold():
+    client = FakeClient(fails=True)
+
+    await fake_voice(client=client).stop_agent("agent-from-a-previous-process")
+
+    # The call was made, and the failure it raised did not escape.
+    assert client.stopped == ["agent-from-a-previous-process"]
+
+
+# --- /start and DELETE ----------------------------------------------------
+
+class StubVoice:
+    """A voice service with an Agora-shaped answer and no Agora behind it."""
+
+    enabled = True
+
+    def __init__(self, *, fails: bool = False):
+        self.fails = fails
+        self.started: list[dict] = []
+        self.stopped: list[str] = []
+
+    def make_join(self, interview_id: str) -> JoinData:
+        return JoinData(
+            enabled=True,
+            app_id=APP_ID,
+            channel=f"quorum-{interview_id}",
+            uid=4242,
+            token="join-token",
+            agent_uid=99887766,
+        )
+
+    async def start_agent(self, join, *, llm_url, llm_token, greeting, instructions) -> str:
+        if self.fails:
+            raise RuntimeError("agora refused the agent")
+        self.started.append(
+            {
+                "channel": join.channel,
+                "llm_url": llm_url,
+                "llm_token": llm_token,
+                "greeting": greeting,
+                "instructions": instructions,
+            }
+        )
+        return "agent-abc"
+
+    async def stop_agent(self, agent_id: str) -> None:
+        self.stopped.append(agent_id)
+
+    async def say(self, agent_id, text, *, interrupt=False) -> None:
+        return None
+
+    async def interrupt(self, agent_id) -> None:
+        return None
+
+
+@pytest.fixture
+def voice_client(settings):
+    """A client whose backend is reachable by an agent, with voice left injectable."""
+    reachable = settings.model_copy(
+        update={
+            "CUSTOM_LLM_PUBLIC_BASE_URL": PUBLIC_BASE_URL,
+            "CUSTOM_LLM_AUTH_SECRET": LLM_SECRET,
+        }
+    )
+    with TestClient(create_app(reachable), raise_server_exceptions=True) as test_client:
+        yield test_client
+
+
+def segments(app, interview_id):
+    return repo.list_segments(app.state.db, interview_id)
+
+
+def test_start_greets_the_candidate_in_the_transcript_even_without_voice(client, app, candidate):
+    response = client.post(f"/api/interviews/{candidate['id']}/start", headers=ORIGIN)
+
+    assert response.status_code == 200
+    assert response.json() == {"voice": {"enabled": False}}
+
+    greeting = segments(app, candidate["id"])[0]
+    assert greeting["speaker"] == "technical"
+    assert greeting["kind"] == "greeting"
+    assert greeting["status"] == "complete"
+    assert greeting["stage"] == "briefing"
+    assert greeting["generation"] == 0
+    assert "AI" in greeting["text"]
+    assert greeting["text"] == prompts.greeting_text("Ada Lovelace")
+
+
+def test_starting_twice_does_not_greet_twice(client, app, candidate):
+    client.post(f"/api/interviews/{candidate['id']}/start", headers=ORIGIN)
+    client.post(f"/api/interviews/{candidate['id']}/start", headers=ORIGIN)
+
+    kinds = [segment["kind"] for segment in segments(app, candidate["id"])]
+    assert kinds == ["greeting"]
+
+
+def test_start_launches_the_agent_and_reports_the_channel(voice_client):
+    app = voice_client.app
+    voice = StubVoice()
+    app.state.voice = voice
+    interview = create_interview(voice_client)
+
+    response = voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    assert response.status_code == 200
+    assert response.json()["voice"] == {
+        "enabled": True,
+        "app_id": APP_ID,
+        "channel": f"quorum-{interview['id']}",
+        "uid": 4242,
+        "token": "join-token",
+        "agent_uid": 99887766,
+        "agent_id": "agent-abc",
+    }
+
+    row = repo.get_interview(app.state.db, interview["id"])
+    assert row["status"] == "live"
+    assert row["voice_status"] == "connecting"
+    assert row["agora_channel"] == f"quorum-{interview['id']}"
+    assert row["agora_agent_id"] == "agent-abc"
+    assert row["agora_uid"] == 4242
+    assert row["agora_agent_uid"] == 99887766
+
+    assert voice.started == [
+        {
+            "channel": f"quorum-{interview['id']}",
+            "llm_url": f"{PUBLIC_BASE_URL}/llm/{interview['id']}/chat/completions",
+            "llm_token": llm_token(app.state.settings, interview["id"]),
+            "greeting": prompts.greeting_text("Ada Lovelace"),
+            "instructions": prompts.agent_instructions(),
+        }
+    ]
+
+
+def test_starting_again_replaces_the_running_agent(voice_client):
+    voice = StubVoice()
+    voice_client.app.state.voice = voice
+    interview = create_interview(voice_client)
+
+    voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+    voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    # The reload got its own agent, and the first one was not left talking.
+    assert len(voice.started) == 2
+    assert voice.stopped == ["agent-abc"]
+
+
+def test_start_falls_back_to_text_when_the_agent_will_not_start(voice_client):
+    app = voice_client.app
+    app.state.voice = StubVoice(fails=True)
+    interview = create_interview(voice_client)
+
+    response = voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    assert response.status_code == 200
+    body = response.json()["voice"]
+    assert body["enabled"] is False
+    assert body["reason"]
+
+    row = repo.get_interview(app.state.db, interview["id"])
+    assert row["status"] == "live"
+    assert row["voice_status"] == "disconnected"
+    assert row["agora_agent_id"] is None
+    # The interview still opens with the disclosure, spoken or not.
+    assert segments(app, interview["id"])[0]["kind"] == "greeting"
+
+
+def test_a_failed_restart_leaves_no_agent_id_behind(voice_client):
+    app = voice_client.app
+    voice = StubVoice()
+    app.state.voice = voice
+    interview = create_interview(voice_client)
+    voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    voice.fails = True
+    voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    row = repo.get_interview(app.state.db, interview["id"])
+    assert voice.stopped == ["agent-abc"]
+    assert row["voice_status"] == "disconnected"
+    assert row["agora_agent_id"] is None
+    assert row["agora_channel"] is None
+
+
+def test_deleting_an_interview_stops_its_agent(voice_client):
+    app = voice_client.app
+    voice = StubVoice()
+    app.state.voice = voice
+    interview = create_interview(voice_client)
+    voice_client.post(f"/api/interviews/{interview['id']}/start", headers=ORIGIN)
+
+    response = voice_client.delete(f"/api/interviews/{interview['id']}", headers=ORIGIN)
+
+    assert response.status_code == 204
+    assert voice.stopped == ["agent-abc"]
+
+
+def test_deleting_a_text_interview_stops_nothing(voice_client):
+    voice = StubVoice()
+    voice_client.app.state.voice = voice
+    interview = create_interview(voice_client)
+
+    voice_client.delete(f"/api/interviews/{interview['id']}", headers=ORIGIN)
+
+    assert voice.stopped == []
+
+
+def test_health_reports_the_service_that_was_built(voice_client):
+    voice_client.app.state.voice = StubVoice()
+
+    assert voice_client.get("/api/health").json()["voice_enabled"] is True

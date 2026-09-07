@@ -77,7 +77,8 @@ def test_start_marks_the_interview_live_and_reports_voice_off(client, app, candi
     assert row["status"] == "live"
     assert row["started_at"] is not None
     assert row["voice_status"] == "off"
-    assert event_types(app, candidate["id"]) == ["voice_status"]
+    # The greeting opens the transcript whether or not anyone says it aloud.
+    assert event_types(app, candidate["id"]) == ["transcript_segment", "voice_status"]
 
 
 def test_start_twice_keeps_the_original_start_time(client, app, candidate):

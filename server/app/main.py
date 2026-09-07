@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import background
 from app.config import Settings, get_settings
 from app.execution.executor import build_executor
+from app.interview.agora import build_voice
 from app.interview.controller import InterviewController
 from app.interview.llm_client import build_llm
 from app.routes import auth, events, files, interviews, llm, runs, turns
@@ -40,8 +41,8 @@ async def lifespan(app: FastAPI):
     app.state.executor = build_executor(settings)
     app.state.llm = build_llm(settings)
     app.state.background_tasks = set()
+    app.state.voice = build_voice(settings)
     app.state.controller = InterviewController(app)
-    # task 7: voice
 
     yield
 
@@ -82,12 +83,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def health():
         executor = getattr(app.state, "executor", None)
         llm = getattr(app.state, "llm", None)
+        voice = getattr(app.state, "voice", None)
         return {
             "status": "ok",
             "executor": getattr(executor, "name", "none"),
             "llm_provider": settings.LLM_PROVIDER,
             "llm_model": getattr(llm, "model_id", settings.LLM_MODEL),
-            "voice_enabled": settings.voice_configured,
+            "voice_enabled": voice.enabled if voice is not None else settings.voice_configured,
         }
 
     return app

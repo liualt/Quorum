@@ -1,6 +1,7 @@
 """Interview lifecycle: create, read, start, pause, finish, delete."""
 
 import logging
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -9,10 +10,13 @@ from pydantic import BaseModel, Field
 
 from app import ids
 from app.execution import runs as run_service
+from app.interview import prompts
+from app.interview.controller import segment_view
 from app.interview.state import ControllerState
 from app.routes.deps import (
     COOKIE_CANDIDATE,
     hash_token,
+    llm_token,
     new_token,
     require_candidate,
     require_participant,
@@ -30,17 +34,26 @@ mutations = APIRouter(
     prefix="/api/interviews", tags=["interviews"], dependencies=[Depends(require_same_origin)]
 )
 
+#: Everything `/start` records about the conversation the agent joins.
+AGORA_COLUMNS = ("agora_channel", "agora_agent_id", "agora_uid", "agora_agent_uid")
+
 
 def initial_state_json() -> str:
     """The controller state a new interview starts from."""
     return ControllerState().to_json()
 
 
-def delete_interview(app, interview_id: str) -> None:
-    """Remove every trace of an interview: its rows and its snapshot directory.
+async def delete_interview(app, interview_id: str) -> None:
+    """Remove every trace of an interview: its agent, its rows, its snapshots.
 
     Task 8 relocates this to `app/cleanup.py`, where expiry reuses it.
     """
+    row = repo.get_interview(app.state.db, interview_id)
+    voice = getattr(app.state, "voice", None)
+    if row is not None and row["agora_agent_id"] and voice is not None:
+        # Before the rows go, while the agent id is still readable. `stop_agent`
+        # never raises, so a deletion is never blocked by Agora.
+        await voice.stop_agent(row["agora_agent_id"])
     repo.delete_interview_rows(app.state.db, interview_id)
     snapshots.delete_interview_dir(app.state.settings.SNAPSHOT_DIR, interview_id)
 
@@ -107,14 +120,45 @@ async def start_interview(
     interview_id: str, request: Request, row=Depends(require_candidate)
 ) -> dict:
     app = request.app
+    greeting = prompts.greeting_text(row["display_name"])
     join = {"enabled": False}
     voice_status = "off"
+    agora = {}
 
     voice = getattr(app.state, "voice", None)
     if voice is not None and voice.enabled:
-        # task 7: start agent — mint the Agora join here, launch the agent, and
-        # replace `join` and `voice_status` with what it reports.
-        logger.info("a voice service is configured but the agent is not wired up yet")
+        if row["agora_agent_id"]:
+            # A reloaded page starts again; two agents in one channel would talk
+            # over each other, and the browser needs a fresh token regardless.
+            await voice.stop_agent(row["agora_agent_id"])
+        join_data = voice.make_join(interview_id)
+        try:
+            agent_id = await voice.start_agent(
+                join_data,
+                llm_url=_llm_url(app.state.settings, interview_id),
+                llm_token=llm_token(app.state.settings, interview_id),
+                greeting=greeting,
+                instructions=prompts.agent_instructions(),
+            )
+        except Exception:
+            # Voice is the medium, not the interview. Losing it costs the
+            # candidate the microphone, and nothing else.
+            logger.exception("could not start the voice agent for %s", interview_id)
+            voice_status = "disconnected"
+            join = {"enabled": False, "reason": "the voice agent could not be reached"}
+            # Any earlier agent was stopped above; leave no id for `/finish` or
+            # a deletion to chase.
+            agora = dict.fromkeys(AGORA_COLUMNS)
+        else:
+            join_data.agent_id = agent_id
+            join = asdict(join_data)
+            voice_status = "connecting"
+            agora = {
+                "agora_channel": join_data.channel,
+                "agora_agent_id": agent_id,
+                "agora_uid": join_data.uid,
+                "agora_agent_uid": join_data.agent_uid,
+            }
 
     repo.update_interview(
         app.state.db,
@@ -123,9 +167,46 @@ async def start_interview(
         # A second start must not restart the clock the session cap runs on.
         started_at=row["started_at"] or ids.now_iso(),
         voice_status=voice_status,
+        **agora,
     )
+    _ensure_greeting(app, interview_id, greeting)
     emit(app.state.db, app.state.bus, interview_id, "voice_status", {"status": voice_status})
     return {"voice": join}
+
+
+def _llm_url(settings, interview_id: str) -> str:
+    """Where the voice agent reaches this backend for every candidate turn."""
+    return f"{settings.CUSTOM_LLM_PUBLIC_BASE_URL}/llm/{interview_id}/chat/completions"
+
+
+def _ensure_greeting(app, interview_id: str, greeting: str) -> None:
+    """Open the transcript with the disclosure, spoken or not, exactly once.
+
+    With voice, Agora says this line from its own greeting configuration rather
+    than asking the model endpoint for it; the segment is the written record of
+    the same words. A second `/start` must not repeat either.
+    """
+    existing = repo.list_segments(app.state.db, interview_id)
+    if any(segment["kind"] == "greeting" for segment in existing):
+        return
+    row = repo.insert_segment(
+        app.state.db,
+        id=ids.new_id("seg"),
+        interview_id=interview_id,
+        speaker="technical",
+        kind="greeting",
+        text=greeting,
+        stage="briefing",
+        generation=0,
+        status="complete",
+    )
+    emit(
+        app.state.db,
+        app.state.bus,
+        interview_id,
+        "transcript_segment",
+        {"segment": segment_view(row)},
+    )
 
 
 @mutations.post("/{interview_id}/pause")
@@ -161,7 +242,7 @@ async def finish_interview(row=Depends(require_candidate)) -> dict:
 async def delete_interview_route(
     interview_id: str, request: Request, participant=Depends(require_participant)
 ) -> Response:
-    delete_interview(request.app, interview_id)
+    await delete_interview(request.app, interview_id)
     return Response(status_code=204)
 
 
