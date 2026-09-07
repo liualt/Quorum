@@ -104,7 +104,14 @@ class LocalExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env={"PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1"},
+                encoding="utf-8",
+                errors="replace",
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONIOENCODING": "utf-8",
+                    **({"SYSTEMROOT": os.environ["SYSTEMROOT"]} if "SYSTEMROOT" in os.environ else {}),
+                },
                 start_new_session=True,
             )
             try:
@@ -225,6 +232,18 @@ def _write_workspace(workdir: str, files: dict[str, str]) -> None:
 
 
 def _kill_process_group(process: subprocess.Popen) -> None:
+    if os.name == "nt":
+        # Killing only the wrapper leaves check children holding its pipes open.
+        subprocess.run(
+            [os.path.join(os.environ["SYSTEMROOT"], "System32", "taskkill.exe"),
+             "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if process.poll() is None:
+            process.kill()
+        return
     try:
         os.killpg(os.getpgid(process.pid), signal.SIGKILL)
     except (ProcessLookupError, PermissionError):

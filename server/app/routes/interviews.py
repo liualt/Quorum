@@ -133,7 +133,11 @@ async def start_interview(
     # transcript. Whether an agent already exists is read and acted on here.
     async with app.state.controller.interview_lock(interview_id):
         # The row the dependency read can predate a start that just finished.
-        current = repo.get_interview(app.state.db, interview_id) or row
+        current = repo.get_interview(app.state.db, interview_id)
+        if current is None:
+            raise HTTPException(404, "interview not found")
+        if current["status"] not in ("created", "live"):
+            raise HTTPException(409, "this interview can no longer be started")
         greeting = prompts.greeting_text(current["display_name"])
         join, voice_status, agora = await _join_voice(
             app, interview_id, current, greeting, with_voice=with_voice

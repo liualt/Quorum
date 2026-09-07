@@ -112,6 +112,12 @@ async def start_replay(app, interview_id: str, run_id: str):
         raise RunError(404, "run not found")
     if original["status"] != "completed":
         raise RunError(409, "only a completed run can be replayed")
+    if original["replay_of"]:
+        raise RunError(409, "replay the original run, not a replay")
+    scenario = app.state.scenario
+    if (original["fixture_version"] != scenario.fixture_version
+            or original["check_version"] != scenario.check_version):
+        raise RunError(409, "the original fixture and check versions are not available")
     if repo.active_run(conn, interview_id) is not None:
         raise RunError(409, "a run is already in progress")
     replays = [row for row in repo.list_runs(conn, interview_id) if row["replay_of"] == run_id]

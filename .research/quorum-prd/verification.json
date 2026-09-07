@@ -1,0 +1,13 @@
+{
+  "markdown_words": 6258,
+  "content_blocks_verified": 347,
+  "hyperlinks_verified": 14,
+  "unique_hyperlinks": 14,
+  "docx_bytes": 56484,
+  "content_parity": true,
+  "tables": 8,
+  "visual_review": "unavailable: bundled LibreOffice absent; canonical renderer attempted",
+  "structural_checks": "passed",
+  "readme_words": 118,
+  "sections": 19
+}

@@ -6,6 +6,8 @@ means the whole path — cookie, snapshot, background task, run view — works.
 
 import os
 
+import pytest
+
 from app.storage import repo
 from tests.conftest import (
     CHANGED_CHECK,
@@ -44,6 +46,19 @@ def test_the_interview_view_reports_the_scenario_and_the_limits(client, app, can
 
 
 # --- start and pause ------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["finishing", "finished", "deleted"])
+def test_start_cannot_reopen_a_closed_interview(client, app, candidate, status):
+    repo.update_interview(app.state.db, candidate["id"], status=status)
+    before = event_types(app, candidate["id"])
+
+    response = client.post(f"/api/interviews/{candidate['id']}/start", headers=ORIGIN)
+
+    assert response.status_code == 409
+    assert repo.get_interview(app.state.db, candidate["id"])["status"] == status
+    assert repo.list_segments(app.state.db, candidate["id"]) == []
+    assert event_types(app, candidate["id"]) == before
 
 def test_start_marks_the_interview_live_and_reports_voice_off(client, app, candidate):
     response = client.post(f"/api/interviews/{candidate['id']}/start", headers=ORIGIN)

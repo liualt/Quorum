@@ -39,7 +39,7 @@ cp ../.env.example .env          # every line is commented; uncomment what you s
 uv run uvicorn --factory app.main:create_app --port 8000
 ```
 
-Every setting has a working default, so `server/.env` needs only these for text mode:
+The defaults select real providers. For offline text mode, set these in `server/.env`:
 
 ```
 LLM_PROVIDER=scripted
@@ -117,7 +117,7 @@ For a hosted demo, deploy Next.js separately and run FastAPI as one persistent c
 ## Tests
 
 ```bash
-cd server && uv run pytest -q          # 400 passed
+cd server && uv run pytest -q
 cd web && npx playwright install chromium && npm run test:e2e
 ```
 

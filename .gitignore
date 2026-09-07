@@ -1,4 +1,6 @@
 node_modules/
+.tools/
+.pytest_cache/
 .next/
 .venv/
 __pycache__/

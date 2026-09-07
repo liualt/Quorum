@@ -103,6 +103,30 @@ async def test_local_executor_writes_nested_workspace_files():
     assert result.stdout.strip() == '{"users": []}'
 
 
+async def test_local_executor_timeout_kills_children_holding_output_pipes():
+    files = {"runner.py": (
+        "import subprocess, sys, time\n"
+        "sys.stdin.read()\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "print('started', flush=True)\n"
+        "time.sleep(30)\n"
+    )}
+    result = await LocalExecutor().run(files, "{}", timeout_s=1, output_cap=1000)
+
+    assert result.status == "timeout"
+    assert result.exit_code is None
+    assert "started" in result.stdout
+    assert result.duration_ms < 10_000
+
+
+async def test_local_executor_preserves_unicode_output():
+    files = {"runner.py": "import sys\nsys.stdin.read()\nprint('caf\\u00e9 \\u4f60\\u597d')\n"}
+    result = await LocalExecutor().run(files, "{}", timeout_s=20, output_cap=1000)
+
+    assert result.status == "completed"
+    assert result.stdout.strip() == "café 你好"
+
+
 def test_local_executor_is_labelled_as_the_development_executor():
     assert "Development and test executor" in LocalExecutor.__doc__
 

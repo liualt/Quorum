@@ -111,6 +111,10 @@ At finish, the assessment service gives the model the structured record (claims 
 
 ## 10. Implementation order and status
 
+This table records the original implementation handoff, not release acceptance.
+The current audit, corrective tasks, and fresh verification results are in
+[the 7 September audit](docs/audit-2026-09-07.md). Live-provider acceptance remains open.
+
 Built as the twelve tasks of [the implementation plan](docs/superpowers/plans/2026-09-07-quorum-mvp.md), each one reviewed before the next was dispatched.
 
 | # | Task | Status |

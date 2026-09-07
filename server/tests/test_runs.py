@@ -312,6 +312,36 @@ async def test_a_crashing_executor_does_not_leak_its_error_to_the_candidate(live
 
 # --- replay ---------------------------------------------------------------
 
+
+async def test_replay_cannot_start_a_new_replay_chain(live_app, seeded):
+    interview, snapshot = seeded
+    original = await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+    await drain(live_app)
+    replay = await runs.start_replay(live_app, interview["id"], original["id"])
+    await drain(live_app)
+
+    with pytest.raises(RunError, match="original run") as error:
+        await runs.start_replay(live_app, interview["id"], replay["id"])
+
+    assert error.value.status_code == 409
+    assert len(repo.list_runs(live_app.state.db, interview["id"])) == 2
+
+
+@pytest.mark.parametrize("version_field", ["fixture_version", "check_version"])
+async def test_replay_refuses_unavailable_historical_versions(live_app, seeded, version_field):
+    interview, snapshot = seeded
+    original = await runs.start_run(live_app, interview["id"], snapshot["id"], [INITIAL_CHECK], None)
+    await drain(live_app)
+    before = dict(repo.get_run(live_app.state.db, original["id"]))
+    setattr(live_app.state.scenario, version_field, "v2")
+
+    with pytest.raises(RunError, match="versions are not available") as error:
+        await runs.start_replay(live_app, interview["id"], original["id"])
+
+    assert error.value.status_code == 409
+    assert dict(repo.get_run(live_app.state.db, original["id"])) == before
+    assert len(repo.list_runs(live_app.state.db, interview["id"])) == 1
+
 async def test_replay_reruns_the_original_and_leaves_it_untouched(live_app, seeded, scenario):
     interview, snapshot = seeded
 

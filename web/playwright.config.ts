@@ -4,7 +4,7 @@ import { defineConfig, devices } from "@playwright/test";
  * The browser end-to-end suite.
  *
  * Both halves of the app are started here, on ports of their own, against a
- * database that is deleted first: the golden flow asserts on stage transitions
+ * fresh temporary database: the golden flow asserts on stage transitions
  * and run counts, so it has to begin from an empty record every time. The two
  * test doubles the backend ships — the scripted model and the local executor —
  * are what make the run deterministic; nothing here exercises Agora, a real
@@ -25,8 +25,6 @@ const BACKEND_ENV = {
   LLM_PROVIDER: "scripted",
   EXECUTOR: "local",
   SESSION_SECRET: "e2e",
-  DATABASE_PATH: "./data/e2e.db",
-  SNAPSHOT_DIR: "./data/e2e-snapshots",
   ALLOWED_ORIGINS: WEB_URL,
   FOLLOW_UP_DELAY_SECONDS: "2",
   CUSTOM_LLM_PUBLIC_BASE_URL: "",
@@ -34,11 +32,6 @@ const BACKEND_ENV = {
   AGORA_APP_ID: "",
   AGORA_APP_CERTIFICATE: "",
 };
-
-// SQLite in WAL mode keeps two sidecar files; leaving them behind would restore
-// a database whose main file has just been deleted.
-const RESET_DB =
-  "rm -rf data/e2e.db data/e2e.db-wal data/e2e.db-shm data/e2e-snapshots";
 
 export default defineConfig({
   testDir: "./tests",
@@ -61,12 +54,11 @@ export default defineConfig({
 
   webServer: [
     {
-      command: `${RESET_DB} && uv run uvicorn --factory app.main:create_app --port ${BACKEND_PORT}`,
+      command: "uv run python ../scripts/e2e_server.py",
       cwd: "../server",
       url: `${BACKEND_URL}/api/health`,
       env: BACKEND_ENV,
-      // Always a fresh backend: a server left over from another run would be
-      // holding the database this one just deleted.
+      // Always start the backend that owns this test's temporary data.
       reuseExistingServer: false,
       timeout: 180_000,
       stdout: "pipe",
