@@ -128,7 +128,7 @@ def _authorise(request: Request, interview_id: str, accepted: tuple[str, ...]):
 
     conn = request.app.state.db
     row = repo.get_interview(conn, interview_id)
-    if row is None:
+    if row is None or row["status"] == "deleted":
         raise HTTPException(404, "interview not found")
 
     settings = request.app.state.settings

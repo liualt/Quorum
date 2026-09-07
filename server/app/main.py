@@ -5,6 +5,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +16,7 @@ from app.evidence.claims import extract_and_store_claims
 from app.evidence.disputes import mark_findings_needing_review
 from app.evidence.links import link_run_to_claims
 from app.execution.executor import build_executor
+from app.execution.runs import recover_interrupted_runs
 from app.interview.agora import build_voice
 from app.interview.controller import InterviewController
 from app.interview.llm_client import build_llm
@@ -52,7 +54,7 @@ async def lifespan(app: FastAPI):
     app.state.controller = InterviewController(app)
     # One lock per interview for `/finish`, apart from the controller's turn lock:
     # finishing awaits the claim extractions, which take the turn lock themselves.
-    app.state.finish_locks = {}
+    app.state.finish_locks = WeakValueDictionary()
 
     # The evidence hooks earlier modules reach through `getattr`: the controller
     # schedules claim extraction and hands completed runs to the linker, and the
@@ -68,6 +70,7 @@ async def lifespan(app: FastAPI):
     )
 
     await cleanup.expire_interviews(app, ids.now_iso())
+    recover_interrupted_runs(app)
     background.spawn_periodic(
         app,
         lambda: cleanup.expire_interviews(app, ids.now_iso()),

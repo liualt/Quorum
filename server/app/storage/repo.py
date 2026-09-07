@@ -66,7 +66,7 @@ def update_interview(conn, id, **fields):
 
 def list_expired_interviews(conn, now_iso):
     return conn.execute(
-        "SELECT * FROM interviews WHERE expires_at IS NOT NULL AND expires_at <= ? AND status != 'deleted'",
+        "SELECT * FROM interviews WHERE (expires_at IS NOT NULL AND expires_at <= ?) OR status = 'deleted'",
         (now_iso,),
     ).fetchall()
 
@@ -236,6 +236,12 @@ def active_run(conn, interview_id):
         "SELECT * FROM test_runs WHERE interview_id = ? AND status IN ('queued', 'running') ORDER BY rowid DESC LIMIT 1",
         (interview_id,),
     ).fetchone()
+
+
+def list_active_runs(conn):
+    return conn.execute(
+        "SELECT * FROM test_runs WHERE status IN ('queued', 'running') ORDER BY rowid"
+    ).fetchall()
 
 
 def find_run_by_idempotency(conn, interview_id, key):

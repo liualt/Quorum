@@ -15,13 +15,25 @@ from collections.abc import Callable, Coroutine
 logger = logging.getLogger(__name__)
 
 
-def spawn(app, coro: Coroutine, what: str) -> asyncio.Task:
+def spawn(app, coro: Coroutine, what: str, *, interview_id: str | None = None) -> asyncio.Task:
     """Run `coro` in the background; `what` names it for logs and for `pending`."""
     tasks = _tasks(app, "background_tasks")
     task = asyncio.create_task(_logged(coro, what), name=what)
     tasks.add(task)
+    task.interview_id = interview_id
     task.add_done_callback(tasks.discard)
+    # A queued wrapper may be cancelled before it starts awaiting this coroutine.
+    task.add_done_callback(lambda _: coro.close())
     return task
+
+
+async def cancel_interview(app, interview_id: str) -> None:
+    tasks = [task for task in getattr(app.state, "background_tasks", ())
+             if getattr(task, "interview_id", None) == interview_id and not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def pending(app, prefix: str) -> list[asyncio.Task]:

@@ -152,6 +152,8 @@ async def execute_run(app, run_id: str) -> None:
     except Exception:  # a crash here must not leave the run running forever
         logger.exception("run %s failed before results were produced", run_id)
         fields = {"status": "failed", "stderr_excerpt": EXECUTION_FAILED_MESSAGE}
+    if repo.get_run(conn, run_id) is None:
+        return
     row = repo.update_run(conn, run_id, finished_at=ids.now_iso(), **fields)
 
     row, replay_differs = _compare_with_original(conn, row)
@@ -165,6 +167,19 @@ async def execute_run(app, run_id: str) -> None:
     controller = getattr(app.state, "controller", None)
     if controller is not None:
         await controller.on_run_completed(interview_id, run_id)
+
+
+def recover_interrupted_runs(app) -> int:
+    """A single-worker restart cannot resume the previous process's tasks."""
+    abandoned = repo.list_active_runs(app.state.db)
+    for run in abandoned:
+        row = repo.update_run(
+            app.state.db, run["id"], status="failed", finished_at=ids.now_iso(),
+            results_json=None,
+            stderr_excerpt="The server restarted before this run finished. Please retry.",
+        )
+        emit(app.state.db, app.state.bus, row["interview_id"], "run_completed", {"run": run_view(row)})
+    return len(abandoned)
 
 
 async def _execute(app, run) -> dict:
@@ -260,7 +275,7 @@ def _insert_and_schedule(app, interview_id: str, **fields):
         **fields,
     )
     emit(app.state.db, app.state.bus, interview_id, "run_started", {"run": run_view(row)})
-    background.spawn(app, execute_run(app, run_id), f"run {run_id}")
+    background.spawn(app, execute_run(app, run_id), f"run {run_id}", interview_id=interview_id)
     return row
 
 

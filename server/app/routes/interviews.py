@@ -306,7 +306,9 @@ async def finish_interview(
     """
     app = request.app
     async with _finish_lock(app, interview_id):
-        current = repo.get_interview(app.state.db, interview_id) or row
+        current = repo.get_interview(app.state.db, interview_id)
+        if current is None:
+            raise HTTPException(404, "interview not found")
         assessment = repo.latest_assessment(app.state.db, interview_id)
         if current["status"] == "finished":
             return _finish_response(assessment)

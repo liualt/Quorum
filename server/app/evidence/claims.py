@@ -71,6 +71,9 @@ async def extract_and_store_claims(app, interview_id: str, segment_id: str) -> l
     # Read, change, and write the state without an await in between: a turn
     # that landed during the model call is already in the row being read.
     async with controller.interview_lock(interview_id):
+        interview = repo.get_interview(conn, interview_id)
+        if interview is None or interview["status"] == "deleted":
+            return []
         stored = _store(conn, interview_id, segment, accepted)
         state = controller.load_state(interview_id)
         _apply_to_state(state, payload, stored)

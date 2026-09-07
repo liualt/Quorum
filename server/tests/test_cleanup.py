@@ -6,11 +6,137 @@ import os
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
+import pytest
 
 from app import background, cleanup, ids
 from app.main import create_app
 from app.storage import db, repo
 from tests.conftest import ORIGIN, create_interview, save_files, seed_interview, seed_snapshot
+
+
+async def test_deletion_cancels_only_its_interview_tasks(live_app):
+    interview = seed_interview(live_app)
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    own = background.spawn(live_app, work(), "own", interview_id=interview["id"])
+    other = background.spawn(live_app, asyncio.sleep(60), "other", interview_id="other")
+    await started.wait()
+    await cleanup.delete_interview(live_app, interview["id"])
+    assert own.cancelled()
+    assert stopped.is_set()
+    assert not other.done()
+    assert repo.get_interview(live_app.state.db, interview["id"]) is None
+    assert interview["id"] not in live_app.state.finish_locks
+    assert interview["id"] not in live_app.state.controller._locks
+
+
+@pytest.mark.parametrize("failure", ["hang", "raise"])
+async def test_voice_failure_does_not_prevent_deletion(live_app, monkeypatch, failure):
+    class Voice:
+        async def stop_agent(self, agent_id):
+            if failure == "raise":
+                raise RuntimeError("provider failed")
+            await asyncio.Event().wait()
+
+    interview = seed_interview(live_app)
+    repo.update_interview(live_app.state.db, interview["id"], agora_agent_id="agent")
+    live_app.state.voice = Voice()
+    monkeypatch.setattr(cleanup, "VOICE_STOP_TIMEOUT_SECONDS", 0.01)
+    await asyncio.wait_for(cleanup.delete_interview(live_app, interview["id"]), 1)
+    assert repo.get_interview(live_app.state.db, interview["id"]) is None
+
+
+async def test_late_stream_cannot_recreate_deleted_transcript(live_app):
+    interview = seed_interview(live_app)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class SlowModel:
+        async def stream_text(self, messages):
+            started.set()
+            await release.wait()
+            yield "late words"
+
+    live_app.state.llm = SlowModel()
+    turn = asyncio.create_task(live_app.state.controller.run_turn_collect(
+        interview["id"], "I will investigate the cache", source="candidate"
+    ))
+    await started.wait()
+    await cleanup.delete_interview(live_app, interview["id"])
+    release.set()
+    result = await turn
+    assert result["segment_id"] is None
+    assert repo.list_segments(live_app.state.db, interview["id"]) == []
+    assert repo.list_events(live_app.state.db, interview["id"], 0) == []
+
+
+async def test_interrupted_deletion_is_recovered_on_expiry(live_app):
+    interview = seed_interview(live_app)
+    repo.update_interview(live_app.state.db, interview["id"], status="deleted", expires_at=FUTURE)
+    assert await cleanup.expire_interviews(live_app, ids.now_iso()) == 1
+
+
+async def test_deletion_cancels_a_running_executor(live_app, scenario):
+    from app.execution import runs
+
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    class Executor:
+        name = "test"
+
+        async def run(self, *args, **kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+    live_app.state.executor = Executor()
+    interview = seed_interview(live_app)
+    snapshot = seed_snapshot(live_app, interview["id"], dict(scenario.editable_files))
+    await runs.start_run(live_app, interview["id"], snapshot["id"], ["access_filtering"], None)
+    await started.wait()
+    await cleanup.delete_interview(live_app, interview["id"])
+    assert stopped.is_set()
+    assert repo.list_runs(live_app.state.db, interview["id"]) == []
+    assert not os.path.exists(snapshot_dir(live_app, interview["id"]))
+
+
+async def test_delete_waits_for_finish_then_removes_its_assessment(live_app):
+    from types import SimpleNamespace
+    from app.routes.interviews import finish_interview
+
+    interview = seed_interview(live_app)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = live_app.state.llm
+
+    class SlowModel:
+        model_id = original.model_id
+
+        async def complete_json(self, messages):
+            started.set()
+            await release.wait()
+            return await original.complete_json(messages)
+
+    live_app.state.llm = SlowModel()
+    finish = asyncio.create_task(finish_interview(
+        interview["id"], SimpleNamespace(app=live_app), row=interview
+    ))
+    await started.wait()
+    deletion = asyncio.create_task(cleanup.delete_interview(live_app, interview["id"]))
+    await asyncio.sleep(0)
+    assert not deletion.done()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(finish, deletion), 2)
+    assert repo.get_interview(live_app.state.db, interview["id"]) is None
+    assert repo.latest_assessment(live_app.state.db, interview["id"]) is None
 
 
 def iso(moment: datetime) -> str:

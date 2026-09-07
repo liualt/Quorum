@@ -55,7 +55,7 @@ def test_start_cannot_reopen_a_closed_interview(client, app, candidate, status):
 
     response = client.post(f"/api/interviews/{candidate['id']}/start", headers=ORIGIN)
 
-    assert response.status_code == 409
+    assert response.status_code == (404 if status == "deleted" else 409)
     assert repo.get_interview(app.state.db, candidate["id"])["status"] == status
     assert repo.list_segments(app.state.db, candidate["id"]) == []
     assert event_types(app, candidate["id"]) == before

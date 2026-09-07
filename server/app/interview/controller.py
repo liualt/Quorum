@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from weakref import WeakValueDictionary
 
 from app import background, ids
 from app.execution.runs import run_view
@@ -168,7 +169,7 @@ class TurnPlan:
 class InterviewController:
     def __init__(self, app):
         self._app = app
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         # interview id -> the generation whose stream is open right now
         self._streaming: dict[str, int] = {}
 
@@ -205,6 +206,9 @@ class InterviewController:
         )
 
     def current_generation(self, interview_id: str) -> int:
+        row = repo.get_interview(self._db, interview_id)
+        if row is None or row["status"] == "deleted":
+            return -1
         return self.load_state(interview_id).generation
 
     def allowed_check_ids(self, interview_id: str) -> list[str]:
@@ -443,6 +447,9 @@ class InterviewController:
         return [segment_view(row) for row in rows]
 
     def _record_role_segment(self, plan: TurnPlan, text: str, status: str, outcome: TurnOutcome) -> None:
+        interview = repo.get_interview(self._db, plan.interview_id)
+        if interview is None or interview["status"] == "deleted":
+            return
         row = self._insert_segment(
             plan.interview_id, speaker=plan.role, kind=plan.kind, text=text, stage=plan.stage,
             generation=plan.generation, status=status,
@@ -494,6 +501,7 @@ class InterviewController:
             self._app,
             extractor(self._app, interview_id, segment_id),
             f"{claims_task_prefix(interview_id)}{segment_id}",
+            interview_id=interview_id,
         )
 
     # --- runs -------------------------------------------------------------------
@@ -518,6 +526,7 @@ class InterviewController:
                 self._app,
                 self._proactive_follow_up(interview_id, run_id, generation),
                 f"follow-up on {run_id}",
+                interview_id=interview_id,
             )
 
     async def _proactive_follow_up(self, interview_id: str, run_id: str, generation: int) -> None:
