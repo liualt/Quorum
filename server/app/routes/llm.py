@@ -30,7 +30,8 @@ async def chat_completions(interview_id: str, request: Request) -> StreamingResp
     settings = app.state.settings
     if not settings.llm_endpoint_enabled:
         raise HTTPException(503, "the model endpoint is not configured")
-    if not hmac.compare_digest(llm_token(settings, interview_id), _bearer(request)):
+    expected = llm_token(settings, interview_id).encode()
+    if not hmac.compare_digest(expected, _bearer(request).encode()):
         raise HTTPException(401, "invalid bearer token")
     if repo.get_interview(app.state.db, interview_id) is None:
         raise HTTPException(404, "interview not found")
@@ -41,11 +42,30 @@ async def chat_completions(interview_id: str, request: Request) -> StreamingResp
         raise HTTPException(400, "the request body is not JSON") from error
     if not isinstance(body, dict) or body.get("stream") is not True:
         raise HTTPException(400, "only streaming completions are served")
+    text = _last_user_text(body.get("messages")).strip()
+    if not text:
+        raise HTTPException(400, "the transcript is empty")
 
-    turn = app.state.controller.run_turn(
-        interview_id, _last_user_text(body.get("messages")), source="candidate"
-    )
-    return StreamingResponse(_completion_chunks(turn), media_type="text/event-stream")
+    turn = app.state.controller.run_turn(interview_id, text, source="candidate")
+    return ClosingStreamingResponse(_completion_chunks(turn), media_type="text/event-stream")
+
+
+class ClosingStreamingResponse(StreamingResponse):
+    """A streaming response that closes its iterator the moment the client is gone.
+
+    Starlette leaves the body iterator suspended on a disconnect, so the turn
+    behind it would be recorded whenever the garbage collector got to it. The
+    interrupted segment has to land now, in order, and the model connection
+    has to be released now, so the iterator is closed on every way out.
+    """
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
 
 def _bearer(request: Request) -> str:

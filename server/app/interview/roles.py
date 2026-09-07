@@ -55,7 +55,12 @@ def _investigation(state: ControllerState, facts: Facts) -> tuple[str, TurnInstr
     covered = state.covered
     if state.pending_run_ids:
         product_silent = state.role_turns_in_stage.get("product", 0) == 0
-        if product_silent and facts.latest_run_passed.get(ISOLATION_CHECK) is True:
+        # The pass must belong to the run being raised now, not to an older one.
+        isolation_passed = (
+            facts.latest_run_id == state.pending_run_ids[-1]
+            and facts.latest_run_passed.get(ISOLATION_CHECK) is True
+        )
+        if product_silent and isolation_passed:
             return "product", TurnInstruction("run_follow_up", PRODUCT_RUN_NOTE)
         return "technical", TurnInstruction("run_follow_up")
     if covered["cross_company"] and covered["revocation"] and not state.revocation_introduced:
@@ -70,9 +75,7 @@ def _changed_condition(state: ControllerState, facts: Facts) -> tuple[str, TurnI
     if not state.revocation_introduced:
         return "customer", TurnInstruction("scenario_notice")
     if state.pending_run_ids:
-        # The newest completed run is the newest pending one: runs are queued
-        # one at a time and every terminal run becomes pending as it lands.
-        revocation_run = REVOCATION_CHECK in facts.latest_run_passed
+        revocation_run = REVOCATION_CHECK in facts.pending_check_ids
         customer_turns = state.role_turns_in_stage.get("customer", 0)
         if revocation_run and customer_turns < CUSTOMER_FOLLOW_UP_LIMIT:
             return "customer", TurnInstruction("run_follow_up")

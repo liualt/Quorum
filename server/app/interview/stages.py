@@ -6,7 +6,7 @@ the clock moves it on regardless (PRD section 4: every session covers the same
 core conditions). `assessment` is set by the finish route, never here.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.interview.state import ControllerState
 
@@ -33,6 +33,8 @@ class Facts:
     revocation_run_completed: bool
     elapsed_minutes: float
     latest_run_passed: dict[str, bool]  # check_id -> passed for the newest completed run
+    latest_run_id: str | None = None  # the run `latest_run_passed` describes
+    pending_check_ids: list[str] = field(default_factory=list)  # checks of the newest pending run
 
 
 def next_stage(state: ControllerState, facts: Facts) -> str:

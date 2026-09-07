@@ -12,6 +12,7 @@ import json
 import pytest
 
 from app import ids
+from app.interview import controller as controller_module
 from app.interview.controller import ENDED_TEXT, RECOVERY_TEXT, InterviewController
 from app.interview.llm_client import LLMError
 from app.interview.state import ControllerState
@@ -219,7 +220,23 @@ async def test_facts_come_from_the_rows(live_app):
     assert facts.completed_runs == 2
     assert facts.revocation_run_completed is True
     assert facts.latest_run_passed == {INITIAL_CHECK: True, CHANGED_CHECK: False}
+    assert facts.latest_run_id == repo.list_runs(live_app.state.db, interview["id"])[-1]["id"]
+    assert facts.pending_check_ids == []
     assert 0.0 <= facts.elapsed_minutes < 1.0
+
+
+async def test_pending_check_ids_follow_the_newest_pending_run(live_app):
+    interview = seed_interview(live_app)
+    passing = completed_run(live_app, interview["id"], [INITIAL_CHECK], {INITIAL_CHECK: True})
+    timed_out = completed_run(live_app, interview["id"], [CHANGED_CHECK], status="timeout")
+    await controller(live_app).on_run_completed(interview["id"], passing["id"])
+    await controller(live_app).on_run_completed(interview["id"], timed_out["id"])
+
+    facts = controller(live_app).facts(interview["id"])
+
+    assert facts.latest_run_id == passing["id"]
+    assert facts.latest_run_passed == {INITIAL_CHECK: True}
+    assert facts.pending_check_ids == [CHANGED_CHECK]
 
 
 # --- interruption ----------------------------------------------------------------
@@ -404,6 +421,75 @@ async def test_the_follow_up_is_spoken_through_the_voice_agent(live_app):
     assert spoken == [("agent_1", rows[0]["text"])]
 
 
+@pytest.fixture
+def held_stream(live_app, monkeypatch):
+    """A model whose first chunk arrives at once and whose rest waits on `release`."""
+    release = asyncio.Event()
+
+    async def slow_stream(messages, **kwargs):
+        yield "Technical"
+        await release.wait()
+        yield " interviewer here. What would you check next?"
+
+    monkeypatch.setattr(live_app.state.llm, "stream_text", slow_stream)
+    return release
+
+
+async def test_the_follow_up_waits_for_the_panel_to_finish_speaking(live_app, held_stream, monkeypatch):
+    live_app.state.settings.FOLLOW_UP_DELAY_SECONDS = 0.05
+    monkeypatch.setattr(controller_module, "FOLLOW_UP_ATTEMPTS", 1000)  # patience, not the bound
+    interview = seed_state(live_app, ControllerState(stage="investigation", candidate_turns_in_stage=1))
+    make_live(live_app, interview["id"])
+    stream = controller(live_app).run_turn(interview["id"], "Let me run it.", source="candidate")
+    assert await anext(stream) == "Technical"
+    run = completed_run(live_app, interview["id"], [INITIAL_CHECK])
+
+    await controller(live_app).on_run_completed(interview["id"], run["id"])
+    await asyncio.sleep(0.15)  # the delay expires while the panel is mid-sentence
+
+    assert [row["speaker"] for row in segments(live_app, interview["id"])] == ["candidate"]
+    assert controller(live_app).current_generation(interview["id"]) == 1
+
+    held_stream.set()
+    rest = "".join([chunk async for chunk in stream])
+    await drain(live_app)
+
+    rows = segments(live_app, interview["id"])
+    assert [(row["speaker"], row["kind"], row["status"]) for row in rows] == [
+        ("candidate", "turn", "complete"),
+        ("technical", "turn", "complete"),
+        ("technical", "follow_up", "complete"),
+    ]
+    assert rows[1]["text"] == "Technical" + rest
+    assert (rows[1]["generation"], rows[2]["generation"]) == (1, 2)
+    assert controller(live_app).load_state(interview["id"]).discussed_run_ids == [run["id"]]
+
+
+async def test_the_follow_up_gives_up_after_its_attempts_and_leaves_the_run_pending(
+    live_app, held_stream, monkeypatch, caplog
+):
+    live_app.state.settings.FOLLOW_UP_DELAY_SECONDS = 0.05
+    monkeypatch.setattr(controller_module, "FOLLOW_UP_ATTEMPTS", 1)
+    interview = seed_state(live_app, ControllerState(stage="investigation", candidate_turns_in_stage=1))
+    make_live(live_app, interview["id"])
+    stream = controller(live_app).run_turn(interview["id"], "Let me run it.", source="candidate")
+    await anext(stream)
+    run = completed_run(live_app, interview["id"], [INITIAL_CHECK])
+
+    await controller(live_app).on_run_completed(interview["id"], run["id"])
+    with caplog.at_level("INFO"):
+        await drain(live_app)
+    held_stream.set()
+    [chunk async for chunk in stream]
+
+    assert "leaving it pending" in caplog.text
+    assert controller(live_app).load_state(interview["id"]).pending_run_ids == [run["id"]]
+    assert [(row["kind"], row["status"]) for row in segments(live_app, interview["id"])] == [
+        ("turn", "complete"),
+        ("turn", "complete"),
+    ]
+
+
 async def test_a_failing_follow_up_is_logged_not_raised(live_app, monkeypatch, caplog):
     live_app.state.settings.FOLLOW_UP_DELAY_SECONDS = 0.05
     interview = seed_state(live_app, ControllerState(stage="investigation", candidate_turns_in_stage=1))
@@ -444,6 +530,23 @@ async def test_a_model_failure_speaks_the_fixed_sentence_and_records_it_pending(
     state = controller(live_app).load_state(interview["id"])
     assert state.role_turns_in_stage == {}
     assert state.stage == "initial_review"
+
+
+async def test_a_model_failure_mid_stream_keeps_what_was_already_said(live_app, monkeypatch):
+    interview = seed_interview(live_app)
+
+    async def failing_after_one(messages, **kwargs):
+        yield "Technical"
+        raise LLMError("upstream down")
+
+    monkeypatch.setattr(live_app.state.llm, "stream_text", failing_after_one)
+
+    result = await turn(live_app, interview["id"], "Done reading.")
+
+    assert result["text"] == f"Technical {RECOVERY_TEXT}"
+    row = repo.get_segment(live_app.state.db, result["segment_id"])
+    assert row["status"] == "pending"
+    assert row["text"] == result["text"]
 
 
 # --- claims extraction hook ------------------------------------------------------

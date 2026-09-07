@@ -41,6 +41,9 @@ RECOVERY_TEXT = "Give me a moment, I lost my train of thought. Could you say tha
 ACCEPTING_TURNS = ("created", "live")
 RECENT_SEGMENTS = 12
 RECENT_RUNS = 3
+# How many follow-up delays a pending run waits for an open stream before it is
+# left for the next candidate turn to raise.
+FOLLOW_UP_ATTEMPTS = 5
 
 # Every instruction kind not listed is stored as an ordinary `turn`.
 SEGMENT_KIND_FOR = {
@@ -91,6 +94,8 @@ class InterviewController:
     def __init__(self, app):
         self._app = app
         self._locks: dict[str, asyncio.Lock] = {}
+        # interview id -> the generation whose stream is open right now
+        self._streaming: dict[str, int] = {}
 
     # --- state ------------------------------------------------------------------
 
@@ -135,6 +140,7 @@ class InterviewController:
 
     def facts(self, interview_id: str) -> Facts:
         row = repo.get_interview(self._db, interview_id)
+        state = ControllerState.from_json(row["state_json"] if row is not None else None)
         runs = [run for run in repo.list_runs(self._db, interview_id) if not run["replay_of"]]
         completed = [run for run in runs if run["status"] == "completed"]
         changed = set(self._changed_condition_check_ids())
@@ -144,6 +150,7 @@ class InterviewController:
                 result["check_id"]: bool(result["passed"])
                 for result in repo.row_json(completed[-1], "results_json") or []
             }
+        pending = [run for run in runs if run["id"] in state.pending_run_ids]
         return Facts(
             completed_runs=len(completed),
             revocation_run_completed=any(
@@ -151,6 +158,8 @@ class InterviewController:
             ),
             elapsed_minutes=_elapsed_minutes(row),
             latest_run_passed=latest_passed,
+            latest_run_id=completed[-1]["id"] if completed else None,
+            pending_check_ids=repo.row_json(pending[-1], "check_ids_json") if pending else [],
         )
 
     # --- turns ------------------------------------------------------------------
@@ -181,6 +190,7 @@ class InterviewController:
 
         pieces: list[str] = []
         status = "complete"
+        self._streaming[interview_id] = plan.generation
         try:
             try:
                 async with aclosing(self._app.state.llm.stream_text(plan.messages)) as stream:
@@ -193,17 +203,24 @@ class InterviewController:
             except LLMError as error:
                 logger.warning("turn %s of %s: %s", plan.generation, interview_id, error)
                 status = "pending"
-                pieces = [RECOVERY_TEXT]
-                yield RECOVERY_TEXT
+                recovery = _joined(pieces, RECOVERY_TEXT)
+                pieces.append(recovery)
+                yield recovery
         except BaseException:
             # The listener went away mid-stream (a closed generator, a cancelled
             # request). Keep what was said; nothing here awaits, so a cancelled
             # task cannot be cancelled again on the way out.
             self._record_role_segment(plan, "".join(pieces), "interrupted", outcome)
             raise
+        finally:
+            self._end_stream(interview_id, plan.generation)
 
         async with self._lock(interview_id):
             self._record_role_segment(plan, "".join(pieces), status, outcome)
+
+    def _end_stream(self, interview_id: str, generation: int) -> None:
+        if self._streaming.get(interview_id) == generation:
+            del self._streaming[interview_id]
 
     def _plan(self, interview_id: str, user_text: str, source: str, outcome: TurnOutcome) -> TurnPlan | None:
         row = repo.get_interview(self._db, interview_id)
@@ -372,14 +389,25 @@ class InterviewController:
             )
 
     async def _proactive_follow_up(self, interview_id: str, run_id: str, generation: int) -> None:
-        """Raise a run the candidate has gone quiet on, unless they spoke first."""
-        await asyncio.sleep(self._app.state.settings.FOLLOW_UP_DELAY_SECONDS)
-        row = repo.get_interview(self._db, interview_id)
-        if row is None or row["status"] != "live" or row["paused"]:
+        """Raise a run the candidate has gone quiet on, unless they spoke first.
+
+        A response that is still streaming when the delay expires is never cut
+        off (PRD section 9: a new finding is queued until the candidate is
+        done); the follow-up waits another delay, a bounded number of times.
+        """
+        for _attempt in range(FOLLOW_UP_ATTEMPTS):
+            await asyncio.sleep(self._app.state.settings.FOLLOW_UP_DELAY_SECONDS)
+            row = repo.get_interview(self._db, interview_id)
+            if row is None or row["status"] != "live" or row["paused"]:
+                return
+            state = ControllerState.from_json(row["state_json"])
+            if run_id not in state.pending_run_ids or state.generation != generation:
+                return  # a turn happened meanwhile; it saw the run
+            if self._streaming.get(interview_id) != state.generation:
+                break  # nobody is speaking
+        else:
+            logger.info("run %s of %s: the panel kept speaking; leaving it pending", run_id, interview_id)
             return
-        state = ControllerState.from_json(row["state_json"])
-        if run_id not in state.pending_run_ids or state.generation != generation:
-            return  # a turn happened meanwhile; it saw the run
 
         outcome = await self.run_turn_collect(interview_id, "", source="run")
         voice = getattr(self._app.state, "voice", None)
@@ -416,6 +444,13 @@ class InterviewController:
 
 def _normalise(text: str | None) -> str:
     return " ".join(re.sub(r"[^\w\s]", "", (text or "").lower()).split())
+
+
+def _joined(pieces: list[str], text: str) -> str:
+    """`text` as the next spoken piece: separated from what came before by a space."""
+    if pieces and not pieces[-1].endswith((" ", "\n")):
+        return " " + text
+    return text
 
 
 def _elapsed_minutes(row) -> float:
