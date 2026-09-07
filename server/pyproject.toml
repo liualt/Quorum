@@ -1,0 +1,41 @@
+[project]
+name = "quorum-server"
+version = "0.1.0"
+description = "Quorum interview backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "sse-starlette",
+    "httpx",
+    "openai",
+    "agora-agents",
+    "e2b",
+    "python-dotenv",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "anyio",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+    "error",
+    "ignore:The anyio\\.abc\\.BlockingPortal alias is deprecated, use anyio\\.from_thread\\.BlockingPortal instead\\.:DeprecationWarning",
+    # Both are raised once, by `agora_agent`'s generated models, at import time:
+    # the SDK still declares its pydantic config the V1 way. Nothing in this
+    # repo can fix them, and neither hides a warning of our own.
+    "ignore:Support for class-based `config` is deprecated, use ConfigDict instead\\.:pydantic.warnings.PydanticDeprecatedSince20",
+    "ignore:Valid config keys have changed in V2:UserWarning",
+]
