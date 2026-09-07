@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+/*
+ * Quorum design tokens — see design-system/quorum/MASTER.md.
+ *
+ * Dark is the only designed mode; there is no light palette to swap to, so the
+ * palette is declared once on :root and color-scheme is pinned to dark.
+ *
+ * The `:root` block below is unlayered, so it always wins over the `@layer
+ * theme` copy Tailwind emits from `@theme inline` — the values here are the
+ * single source of truth, and both `var(--color-*)` and `bg-*`/`text-*`/
+ * `border-*` utilities resolve to them.
+ *
+ * Contrast against --color-background (#0F172A):
+ *   foreground 21:1 · muted-foreground 7.1:1 · accent 8.0:1 · destructive 4.8:1
+ *   border 3.4:1 (non-text UI, AA needs 3:1)
+ * Contrast on --color-card (#1B2336): foreground 15.8:1 · muted-foreground 6.1:1
+ * Text on filled buttons: on-accent/accent 8.0:1 · on-destructive/destructive 5.6:1
+ */
+:root {
+  color-scheme: dark;
+
+  /* Palette */
+  --color-background: #0f172a;
+  --color-foreground: #f8fafc;
+  --color-card: #1b2336;
+  --color-card-foreground: #f8fafc;
+  --color-muted: #272f42;
+  --color-muted-foreground: #94a3b8;
+  --color-border: #475569;
+  --color-primary: #1e293b;
+  --color-on-primary: #ffffff;
+  --color-secondary: #334155;
+  --color-on-secondary: #ffffff;
+  --color-accent: #22c55e;
+  --color-on-accent: #0f172a;
+  --color-destructive: #ef4444;
+  --color-on-destructive: #000000;
+  --color-ring: #ffffff;
+
+  /* Shadow depths */
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px rgb(0 0 0 / 0.1);
+  --shadow-xl: 0 20px 25px rgb(0 0 0 / 0.15);
+
+  /*
+   * Spacing — density 8/10 (dense dashboard). These map one-to-one onto
+   * Tailwind's default 0.25rem scale, so components use the utilities
+   * (gap-2, p-3, mb-6 …) rather than these variables:
+   *   xs 2px = 0.5 · sm 4px = 1 · md 8px = 2 · lg 12px = 3
+   *   xl 16px = 4 · 2xl 24px = 6 · 3xl 32px = 8
+   */
+}
+
+/* Expose the tokens to Tailwind so `bg-background`, `text-muted-foreground`,
+   `border-border`, `font-mono`, `shadow-md` … all resolve. */
+@theme inline {
+  --color-background: var(--color-background);
+  --color-foreground: var(--color-foreground);
+  --color-card: var(--color-card);
+  --color-card-foreground: var(--color-card-foreground);
+  --color-muted: var(--color-muted);
+  --color-muted-foreground: var(--color-muted-foreground);
+  --color-border: var(--color-border);
+  --color-primary: var(--color-primary);
+  --color-on-primary: var(--color-on-primary);
+  --color-secondary: var(--color-secondary);
+  --color-on-secondary: var(--color-on-secondary);
+  --color-accent: var(--color-accent);
+  --color-on-accent: var(--color-on-accent);
+  --color-destructive: var(--color-destructive);
+  --color-on-destructive: var(--color-on-destructive);
+  --color-ring: var(--color-ring);
+
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
+
+  --font-sans: var(--font-ibm-plex-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  /* Dense layout, but body copy keeps the 16px / 1.5 readable baseline. */
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-mono);
+  letter-spacing: -0.01em;
+}
+
+/*
+ * One focus treatment for every control in the app, including third-party ones
+ * (Monaco, React Flow) that never see our Button component. The ring token is
+ * white, so the offset shows the surface behind the control rather than a halo.
+ */
+:focus-visible {
+  outline: 2px solid var(--color-ring);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
