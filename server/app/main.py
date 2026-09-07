@@ -7,10 +7,12 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app import background
 from app.config import Settings, get_settings
 from app.execution.executor import build_executor
+from app.interview.controller import InterviewController
 from app.interview.llm_client import build_llm
-from app.routes import auth, events, files, interviews, runs
+from app.routes import auth, events, files, interviews, llm, runs, turns
 from app.scenario import load_scenario
 from app.storage import db, repo
 from app.storage.events import EventBus
@@ -37,12 +39,14 @@ async def lifespan(app: FastAPI):
     app.state.scenario = load_scenario(scenario_dir, settings.SCENARIO_ID)
     app.state.executor = build_executor(settings)
     app.state.llm = build_llm(settings)
-    # task 6: controller
+    app.state.background_tasks = set()
+    app.state.controller = InterviewController(app)
     # task 7: voice
 
     yield
 
     # task 8: evidence hooks + cleanup
+    await background.cancel_all(app)
     connection.close()
 
 
@@ -70,6 +74,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(runs.mutations)
     app.include_router(events.router)
     app.include_router(auth.mutations)
+    app.include_router(turns.mutations)
+    # The voice agent's endpoint: bearer-authenticated, outside /api and its guards.
+    app.include_router(llm.router)
 
     @app.get("/api/health")
     async def health():

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from app import ids
 from app.execution import runs as run_service
+from app.interview.state import ControllerState
 from app.routes.deps import (
     COOKIE_CANDIDATE,
     hash_token,
@@ -31,12 +32,8 @@ mutations = APIRouter(
 
 
 def initial_state_json() -> str:
-    """The controller state a new interview starts from.
-
-    Task 6 rewires this to `ControllerState().to_json()`; until then the
-    controller is absent and an empty object is what reads it expect.
-    """
-    return "{}"
+    """The controller state a new interview starts from."""
+    return ControllerState().to_json()
 
 
 def delete_interview(app, interview_id: str) -> None:

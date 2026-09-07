@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 
-from app import ids
+from app import background, ids
 from app.execution.checks import evaluate, results_differ
 from app.execution.runner_protocol import (
     build_script,
@@ -65,25 +65,8 @@ def run_view(row) -> dict:
 
 
 def allowed_check_ids(app, interview_id: str) -> list[str]:
-    """The checks the candidate may run right now.
-
-    The controller owns this rule once it exists; without one the answer comes
-    straight off the interview state, so runs work before the interview loop is
-    wired up and in tests that do not need it.
-    """
-    controller = getattr(app.state, "controller", None)
-    if controller is not None:
-        return controller.allowed_check_ids(interview_id)
-
-    row = repo.get_interview(app.state.db, interview_id)
-    state = json.loads((row["state_json"] if row is not None else None) or "{}")
-    revocation_introduced = bool(state.get("revocation_introduced"))
-    return [
-        check.id
-        for check in app.state.scenario.checks
-        if check.introduced_at == "initial"
-        or (revocation_introduced and check.introduced_at == "changed_condition")
-    ]
+    """The checks the candidate may run right now; the controller owns the rule."""
+    return app.state.controller.allowed_check_ids(interview_id)
 
 
 async def start_run(app, interview_id: str, snapshot_id: str, check_ids: list[str],
@@ -271,14 +254,7 @@ def _insert_and_schedule(app, interview_id: str, **fields):
         **fields,
     )
     emit(app.state.db, app.state.bus, interview_id, "run_started", {"run": run_view(row)})
-
-    tasks = getattr(app.state, "background_tasks", None)
-    if tasks is None:
-        tasks = set()
-        app.state.background_tasks = tasks
-    task = asyncio.create_task(execute_run(app, run_id))
-    tasks.add(task)
-    task.add_done_callback(tasks.discard)
+    background.spawn(app, execute_run(app, run_id), f"run {run_id}")
     return row
 
 
