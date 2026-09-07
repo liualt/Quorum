@@ -13,6 +13,9 @@ from app.storage import db, repo, snapshots
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Every mutation is origin-checked, so route tests have to look like the browser.
+ORIGIN = {"Origin": "http://localhost:3000"}
+
 
 @pytest.fixture
 def settings(tmp_path):
@@ -60,6 +63,23 @@ async def live_app(app):
 @pytest.fixture
 def scenario():
     return load_scenario(REPO_ROOT / "scenarios", "document-search")
+
+
+def create_interview(client, display_name="Ada Lovelace"):
+    """Create an interview through the API; `client` keeps the candidate cookie."""
+    response = client.post(
+        "/api/interviews",
+        json={"display_name": display_name, "consent": True},
+        headers=ORIGIN,
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+@pytest.fixture
+def candidate(client):
+    """An interview created through the API, with `client` holding its cookie."""
+    return create_interview(client)
 
 
 def seed_interview(app, *, state_json="{}"):
