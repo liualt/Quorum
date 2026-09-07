@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
     app.state.background_tasks = set()
     app.state.voice = build_voice(settings)
     app.state.controller = InterviewController(app)
+    # One lock per interview for `/finish`, apart from the controller's turn lock:
+    # finishing awaits the claim extractions, which take the turn lock themselves.
+    app.state.finish_locks = {}
 
     # The evidence hooks earlier modules reach through `getattr`: the controller
     # schedules claim extraction and hands completed runs to the linker, and the

@@ -13,7 +13,7 @@ overwritten. Nothing here raises: a model that fails leaves no record at all.
 import logging
 
 from app import ids
-from app.evidence.links import link_challenge
+from app.evidence.links import link_challenge, link_run_to_claims
 from app.execution.runs import run_view
 from app.interview.controller import segment_view
 from app.interview.llm_client import LLMError
@@ -80,6 +80,10 @@ async def extract_and_store_claims(app, interview_id: str, segment_id: str) -> l
         challenger = _challenger(conn, interview_id, segment)
         if challenger is not None:
             link_challenge(conn, interview_id, challenger["id"], sorted({row["scope"] for row in stored}))
+        # A run the candidate started right after speaking may have landed before
+        # the model answered; its own completion hook ran before these claims existed.
+        for run in _runs_since(conn, interview_id, segment):
+            link_run_to_claims(conn, interview_id, run)
     return stored
 
 
@@ -94,6 +98,17 @@ def _segments_before(conn, interview_id: str, segment) -> list[dict]:
 def _recent_runs(conn, interview_id: str) -> list[dict]:
     rows = [row for row in repo.list_runs(conn, interview_id) if not row["replay_of"]]
     return [run_view(row) for row in rows[-RECENT_RUNS:]]
+
+
+def _runs_since(conn, interview_id: str, segment) -> list:
+    """The candidate's completed runs requested no earlier than the segment was spoken."""
+    return [
+        row
+        for row in repo.list_runs(conn, interview_id)
+        if row["status"] == "completed"
+        and not row["replay_of"]
+        and row["created_at"] >= segment["created_at"]
+    ]
 
 
 def _prior_claim(row) -> dict:

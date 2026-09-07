@@ -8,6 +8,8 @@ for one.
 """
 
 import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -18,6 +20,7 @@ from app.evidence.validate import validate_assessment_payload
 from app.interview import prompts
 from app.interview.llm_client import INVALID_REFS_MARKER, LLMError
 from app.interview.prompts import DIMENSIONS, PROMPT_VERSION
+from app.routes import interviews as interviews_module
 from app.storage import repo
 from tests.conftest import (
     COMPLETE_SOLUTION,
@@ -150,12 +153,102 @@ def test_finish_is_idempotent_once_finished(client, app, scenario):
     ).fetchone()["n"] == 1
 
 
-def test_finish_refuses_an_interview_that_is_already_finishing(client, app, candidate):
-    repo.update_interview(app.state.db, candidate["id"], status="finishing")
+def test_a_failure_after_finishing_started_is_resumed_by_the_next_finish(client, app, scenario, monkeypatch):
+    calls = []
+    original = interviews_module.build_assessment
 
-    response = client.post(f"/api/interviews/{candidate['id']}/finish", headers=ORIGIN)
+    async def flaky(app_, interview_id):
+        calls.append(interview_id)
+        if len(calls) == 1:
+            raise RuntimeError("sqlite went away")
+        return await original(app_, interview_id)
 
-    assert response.status_code == 409
+    monkeypatch.setattr(interviews_module, "build_assessment", flaky)
+    flow = run_full_interview(client, scenario, finish=False)
+    interview_id = flow["candidate"]["id"]
+
+    with pytest.raises(RuntimeError):
+        client.post(f"/api/interviews/{interview_id}/finish", headers=ORIGIN)
+
+    assert repo.get_interview(app.state.db, interview_id)["status"] == "finishing"
+    assert client.get(f"/api/interviews/{interview_id}/assessment").status_code == 404
+
+    second = client.post(f"/api/interviews/{interview_id}/finish", headers=ORIGIN)
+
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "complete"
+    assert calls == [interview_id, interview_id]
+    row = repo.get_interview(app.state.db, interview_id)
+    assert row["status"] == "finished"
+    assert row["finished_at"]
+    types = event_types(app, interview_id)
+    assert types.count("assessment_completed") == 1
+    assert types[-1] == "interview_finished"
+    assert get_assessment(client, interview_id)["id"] == second.json()["assessment_id"]
+
+
+def test_a_crash_after_the_assessment_was_stored_is_recovered_without_rebuilding(client, app, scenario):
+    flow = run_full_interview(client, scenario)
+    interview_id = flow["candidate"]["id"]
+    # The attempt got as far as the assessment and died before the row was marked.
+    repo.update_interview(app.state.db, interview_id, status="finishing", finished_at=None)
+    before = event_types(app, interview_id)
+
+    response = client.post(f"/api/interviews/{interview_id}/finish", headers=ORIGIN)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == flow["finish"]
+    row = repo.get_interview(app.state.db, interview_id)
+    assert row["status"] == "finished"
+    assert row["finished_at"]
+    assert event_types(app, interview_id) == [*before, "interview_finished"]
+    assert app.state.db.execute(
+        "SELECT COUNT(*) AS n FROM assessments WHERE interview_id = ?", (interview_id,)
+    ).fetchone()["n"] == 1
+
+
+def test_a_hanging_voice_agent_does_not_hold_up_finish(client, app, candidate, monkeypatch, caplog):
+    class HangingVoice:
+        enabled = True
+
+        async def stop_agent(self, agent_id):
+            await asyncio.sleep(30)
+
+    app.state.voice = HangingVoice()
+    monkeypatch.setattr(interviews_module, "VOICE_STOP_TIMEOUT_SECONDS", 0.1)
+    repo.update_interview(app.state.db, candidate["id"], status="live", agora_agent_id="agent_9")
+    started = time.monotonic()
+
+    with caplog.at_level("WARNING"):
+        response = client.post(f"/api/interviews/{candidate['id']}/finish", headers=ORIGIN)
+
+    assert response.status_code == 200, response.text
+    assert time.monotonic() - started < 5
+    assert "agent_9 did not stop" in caplog.text
+    assert repo.get_interview(app.state.db, candidate["id"])["status"] == "finished"
+
+
+def test_two_finishes_at_once_share_one_assessment(client, app, scenario, monkeypatch):
+    original = interviews_module.build_assessment
+
+    async def slow(app_, interview_id):
+        await asyncio.sleep(0.3)
+        return await original(app_, interview_id)
+
+    monkeypatch.setattr(interviews_module, "build_assessment", slow)
+    flow = run_full_interview(client, scenario, finish=False)
+    interview_id = flow["candidate"]["id"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(
+            lambda _: client.post(f"/api/interviews/{interview_id}/finish", headers=ORIGIN), range(2)
+        ))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert responses[0].json() == responses[1].json()
+    assert app.state.db.execute(
+        "SELECT COUNT(*) AS n FROM assessments WHERE interview_id = ?", (interview_id,)
+    ).fetchone()["n"] == 1
 
 
 def test_the_reviewer_reads_the_same_assessment(client, scenario):
@@ -469,10 +562,15 @@ async def test_a_short_explanation_is_an_error(record):
     ("field", "text"),
     [
         ("summary", "Overall score: strong."),
+        ("summary", "The candidate scores well on the release question."),
         ("title", "Rank among candidates"),
+        ("title", "Ranked third of the week"),
         ("explanation", "Their personality came through in every answer."),
+        ("explanation", "Two personalities were on show during the interview."),
         ("uncertainty", "Whether they were HONEST about the tests."),
+        ("uncertainty", "They spoke honestly about the untested path, it seems."),
         ("follow_up", "Ask whether they were dishonest."),
+        ("follow_up", "Ask whether the ranking of fixes was theirs."),
     ],
 )
 async def test_forbidden_words_are_errors_wherever_they_appear(record, field, text):
@@ -488,7 +586,9 @@ async def test_forbidden_words_are_errors_wherever_they_appear(record, field, te
 
 
 async def test_a_word_that_merely_contains_a_forbidden_one_is_fine(record):
-    payload = record["payload"](summary="The candidate underscored the frank tradeoff.")
+    payload = record["payload"](
+        summary="The candidate underscored the frank tradeoff and scorned the shortcut."
+    )
 
     assert errors_for(record, payload) == []
 

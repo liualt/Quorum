@@ -16,11 +16,19 @@ OBSERVATION_LEVELS = ("demonstrated", "partly_demonstrated", "not_observed")
 REF_TYPES = ("segment", "run", "claim", "snapshot")
 MAX_FINDINGS = 6
 MIN_EXPLANATION_CHARS = 20
-FORBIDDEN_WORDS = ("score", "rank", "personality", "honest", "dishonest")
+# Whole words with their inflections: "scores" and "ranked" are the same promise
+# broken; "underscored" and "frank" are not.
+FORBIDDEN_STEMS = (
+    r"scor(?:e|es|ed|ing)",
+    r"rank(?:s|ed|ing)?",
+    r"personalit(?:y|ies)",
+    r"honest(?:ly)?",
+    r"dishonest(?:ly)?",
+)
 TEXT_FIELDS = ("title", "explanation", "assistance", "uncertainty", "follow_up")
 REF_FIELDS = ("supporting_refs", "opposing_refs")
 
-_FORBIDDEN = re.compile(r"\b(" + "|".join(FORBIDDEN_WORDS) + r")\b", re.IGNORECASE)
+_FORBIDDEN = re.compile(r"\b(?:" + "|".join(FORBIDDEN_STEMS) + r")\b", re.IGNORECASE)
 _GETTERS = {
     "segment": repo.get_segment,
     "run": repo.get_run,

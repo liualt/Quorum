@@ -338,12 +338,12 @@ async def test_a_claim_made_after_the_run_is_not_linked_and_links_are_not_duplic
     [early] = await extract_and_store_claims(live_app, interview["id"], before["id"])
     run = completed_run(live_app, interview["id"], [INITIAL_CHECK], {INITIAL_CHECK: False})
     after = say(live_app, interview["id"], CROSS_COMPANY_TEXT)
-    await extract_and_store_claims(live_app, interview["id"], after["id"])
     # What matters is when the candidate spoke relative to the run's request,
     # not when the claim row was written; the clock is pinned to say so.
     repo.update_segment(conn, before["id"], created_at="2026-09-07T10:00:00.000Z")
     run = repo.update_run(conn, run["id"], created_at="2026-09-07T10:00:01.000Z")
     repo.update_segment(conn, after["id"], created_at="2026-09-07T10:00:02.000Z")
+    await extract_and_store_claims(live_app, interview["id"], after["id"])
 
     link_run_to_claims(conn, interview["id"], run)
     again = link_run_to_claims(conn, interview["id"], run)
@@ -366,6 +366,25 @@ async def test_a_claim_spoken_as_the_run_was_requested_counts_as_before_it(live_
     rows = link_run_to_claims(conn, interview["id"], run)
 
     assert [(row["relation"], row["target_id"]) for row in rows] == [("supports", claim["id"])]
+
+
+async def test_a_run_that_landed_before_the_claims_were_read_is_still_linked(live_app):
+    """Extraction is asynchronous; a quick run completes before the model answers."""
+    interview = seed_interview(live_app)
+    conn = live_app.state.db
+    earlier = completed_run(live_app, interview["id"], [INITIAL_CHECK], {INITIAL_CHECK: True})
+    segment = say(live_app, interview["id"], CROSS_COMPANY_TEXT)
+    later = completed_run(live_app, interview["id"], [INITIAL_CHECK], {INITIAL_CHECK: False})
+    completed_run(live_app, interview["id"], [INITIAL_CHECK], {INITIAL_CHECK: True}, replay_of=later["id"])
+    repo.update_run(conn, earlier["id"], created_at="2026-09-07T10:00:00.000Z")
+    repo.update_segment(conn, segment["id"], created_at="2026-09-07T10:00:01.000Z")
+    repo.update_run(conn, later["id"], created_at="2026-09-07T10:00:02.000Z")
+
+    [diagnosis] = await extract_and_store_claims(live_app, interview["id"], segment["id"])
+
+    assert link_tuples(live_app, interview["id"]) == [
+        ("run", later["id"], "challenges", "claim", diagnosis["id"])
+    ]
 
 
 async def test_a_run_without_results_links_nothing(live_app):

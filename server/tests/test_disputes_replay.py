@@ -7,14 +7,17 @@ import pytest
 
 from app import ids
 from app.evidence.disputes import (
+    DisputeError,
     clear_review_reason,
     create_dispute,
     mark_findings_needing_review,
     resolve_dispute,
 )
+from app.evidence.findings import build_assessment
 from app.execution import runs as runs_module
 from app.storage import repo
 from tests.conftest import (
+    FIRST_TURN,
     INITIAL_CHECK,
     ORIGIN,
     become_reviewer,
@@ -156,9 +159,10 @@ async def test_resolving_clears_the_reason_and_only_that_reason(live_app, eviden
 async def test_a_segment_of_another_interview_cannot_be_disputed(live_app, evidence):
     other = seed_interview(live_app)
 
-    with pytest.raises(LookupError):
+    with pytest.raises(DisputeError) as excinfo:
         create_dispute(live_app.state.db, live_app.state.bus, other["id"], evidence["segment"]["id"], "x", "")
-    with pytest.raises(LookupError):
+    assert excinfo.value.status_code == 404
+    with pytest.raises(DisputeError):
         create_dispute(live_app.state.db, live_app.state.bus, other["id"], "seg_missing", "x", "")
     assert repo.list_disputes(live_app.state.db, other["id"]) == []
 
@@ -169,23 +173,74 @@ async def test_an_unknown_dispute_cannot_be_resolved(live_app, evidence):
     dispute = create_dispute(conn, bus, iid, evidence["segment"]["id"], "x", "")
     other = seed_interview(live_app)
 
-    with pytest.raises(LookupError):
+    with pytest.raises(DisputeError) as excinfo:
         resolve_dispute(conn, bus, iid, "dsp_missing", "x")
-    with pytest.raises(LookupError):
+    assert excinfo.value.status_code == 404
+    with pytest.raises(DisputeError):
         resolve_dispute(conn, bus, other["id"], dispute["id"], "x")
 
 
-async def test_a_dispute_before_any_assessment_affects_nothing(live_app):
+async def test_a_resolved_dispute_is_not_resolved_again(live_app, evidence):
+    conn, bus = live_app.state.db, live_app.state.bus
+    iid = evidence["interview"]["id"]
+    dispute = create_dispute(conn, bus, iid, evidence["segment"]["id"], "x", "")
+    resolve_dispute(conn, bus, iid, dispute["id"], "First word.")
+
+    with pytest.raises(DisputeError) as excinfo:
+        resolve_dispute(conn, bus, iid, dispute["id"], "Second word.")
+
+    assert excinfo.value.status_code == 409
+    assert repo.get_dispute(conn, dispute["id"])["resolution"] == "First word."
+    assert event_types(live_app, iid) == ["dispute_updated"] * 2
+
+
+async def test_a_dispute_filed_before_the_assessment_holds_the_findings_once_built(live_app):
     interview = seed_interview(live_app)
-    conn = live_app.state.db
+    conn, bus = live_app.state.db, live_app.state.bus
+    iid = interview["id"]
     segment = repo.insert_segment(
-        conn, id=ids.new_id("seg"), interview_id=interview["id"], speaker="candidate", kind="turn",
+        conn, id=ids.new_id("seg"), interview_id=iid, speaker="candidate", kind="turn",
         text="Early words.", stage="briefing", generation=1, status="complete",
     )
-
-    dispute = create_dispute(conn, live_app.state.bus, interview["id"], segment["id"], "Later words.", "")
-
+    claim = repo.insert_claim(
+        conn, id=ids.new_id("clm"), interview_id=iid, segment_id=segment["id"], statement="Early words.",
+        claim_type="diagnosis", scope="general", stage="briefing", clarity="clear",
+    )
+    dispute = create_dispute(conn, bus, iid, segment["id"], "Later words.", "")
     assert repo.row_json(dispute, "affected_finding_ids_json") == []
+
+    assessment = await build_assessment(live_app, iid)
+
+    # The scripted assessment cites the first segment and the first claim: this segment, its claim.
+    findings = repo.list_findings(conn, assessment["id"])
+    cited = [
+        row for row in findings
+        if any((ref["ref_type"], ref["ref_id"]) in {("segment", segment["id"]), ("claim", claim["id"])}
+               for ref in repo.list_finding_refs(conn, row["id"]))
+    ]
+    assert cited
+    for row in cited:
+        assert finding_state(conn, row["id"]) == ("needs_review", [f"dispute:{dispute['id']}"])
+    held = repo.get_dispute(conn, dispute["id"])
+    assert repo.row_json(held, "affected_finding_ids_json") == [row["id"] for row in cited]
+    assert held["status"] == "open"
+    assert event_types(live_app, iid) == ["dispute_updated", "dispute_updated", "assessment_completed"]
+
+    resolve_dispute(conn, bus, iid, dispute["id"], "Heard again.")
+
+    assert all(finding_state(conn, row["id"]) == ("ok", []) for row in cited)
+
+
+async def test_applying_open_disputes_again_changes_nothing_and_announces_nothing(live_app, evidence):
+    conn, bus = live_app.state.db, live_app.state.bus
+    iid = evidence["interview"]["id"]
+    from app.evidence.disputes import apply_open_disputes
+
+    dispute = create_dispute(conn, bus, iid, evidence["segment"]["id"], "x", "")
+    apply_open_disputes(conn, bus, iid)
+
+    assert event_types(live_app, iid) == ["dispute_updated"]
+    assert finding_state(conn, evidence["on_segment"]["id"]) == ("needs_review", [f"dispute:{dispute['id']}"])
 
 
 async def test_marking_is_idempotent_per_reason_and_clearing_leaves_other_reasons(live_app, evidence):
@@ -265,6 +320,53 @@ def test_the_candidate_disputes_a_segment_and_the_reviewer_resolves_it(client, a
     assert all(f["review_status"] == "ok" for f in body["dimensions"] + body["findings"])
     assert body["disputes"][0]["status"] == "resolved"
     assert event_types(app, iid)[-2:] == ["dispute_updated", "dispute_updated"]
+
+
+def test_a_correction_filed_during_the_interview_reaches_the_assessment(client, app):
+    candidate = create_interview(client)
+    iid = candidate["id"]
+    client.post(f"/api/interviews/{iid}/start", headers=ORIGIN)
+    client.post(f"/api/interviews/{iid}/turns", json={"text": FIRST_TURN}, headers=ORIGIN)
+    segment = first_candidate_segment(app, iid)
+
+    created = client.post(
+        f"/api/interviews/{iid}/disputes",
+        json={"segment_id": segment["id"], "proposed_text": "I said something else.", "reason": ""},
+        headers=ORIGIN,
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["affected_finding_ids"] == []
+
+    finished = client.post(f"/api/interviews/{iid}/finish", headers=ORIGIN)
+    assert finished.status_code == 200, finished.text
+
+    body = client.get(f"/api/interviews/{iid}/assessment").json()
+    [dispute] = body["disputes"]
+    assert dispute["affected_finding_ids"]
+    held = {f["id"]: f for f in body["dimensions"] + body["findings"]}
+    for finding_id in dispute["affected_finding_ids"]:
+        assert held[finding_id]["review_status"] == "needs_review"
+        assert held[finding_id]["review_reasons"] == [f"dispute:{dispute['id']}"]
+    types = event_types(app, iid)
+    assert types.count("dispute_updated") == 2
+    assert types.index("assessment_completed") > types.index("dispute_updated", types.index("dispute_updated") + 1)
+
+
+def test_resolving_a_resolved_dispute_is_409(client, app, scenario):
+    flow = run_full_interview(client, scenario)
+    iid = flow["candidate"]["id"]
+    segment = first_candidate_segment(app, iid)
+    dispute = client.post(
+        f"/api/interviews/{iid}/disputes",
+        json={"segment_id": segment["id"], "proposed_text": "x", "reason": ""}, headers=ORIGIN,
+    ).json()
+    become_reviewer(client, flow["candidate"])
+    url = f"/api/interviews/{iid}/disputes/{dispute['id']}/resolve"
+    assert client.post(url, json={"resolution": "Done."}, headers=ORIGIN).status_code == 200
+
+    again = client.post(url, json={"resolution": "Again."}, headers=ORIGIN)
+
+    assert again.status_code == 409
 
 
 def test_dispute_routes_refuse_what_is_not_theirs(client, app, scenario):

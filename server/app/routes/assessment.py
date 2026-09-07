@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.evidence import disputes
-from app.evidence.disputes import dispute_view
+from app.evidence.disputes import DisputeError, dispute_view
 from app.evidence.findings import assessment_view
 from app.routes.deps import require_participant, require_reviewer, require_same_origin
 from app.routes.turns import TURN_TEXT_LIMIT
@@ -48,8 +48,8 @@ async def create_dispute(
         row = disputes.create_dispute(
             app.state.db, app.state.bus, interview_id, body.segment_id, body.proposed_text, body.reason
         )
-    except LookupError as error:
-        raise HTTPException(404, str(error)) from error
+    except DisputeError as error:
+        raise HTTPException(error.status_code, error.detail) from error
     return dispute_view(row)
 
 
@@ -66,6 +66,6 @@ async def resolve_dispute(
         resolved = disputes.resolve_dispute(
             app.state.db, app.state.bus, interview_id, dispute_id, body.resolution
         )
-    except LookupError as error:
-        raise HTTPException(404, str(error)) from error
+    except DisputeError as error:
+        raise HTTPException(error.status_code, error.detail) from error
     return dispute_view(resolved)

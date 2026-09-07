@@ -7,7 +7,8 @@ the first answer fails (PRD section 9). An answer that still fails, or a model
 that does not answer, produces a `pending` assessment whose findings are only
 what the checks observed; nothing interpretive is invented in its place.
 Whatever is stored records the rubric, prompt, and model versions it came from
-(PRD section 10). `assessment_view` is the reviewer's and candidate's read of
+(PRD section 10), and starts out under the hold of any correction the candidate
+filed before it existed. `assessment_view` is the reviewer's and candidate's read of
 the stored rows, with every referenced record alongside.
 """
 
@@ -16,7 +17,7 @@ from dataclasses import asdict
 
 from app import ids
 from app.evidence.claims import claim_view
-from app.evidence.disputes import dispute_view
+from app.evidence.disputes import apply_open_disputes, dispute_view
 from app.evidence.links import link_view
 from app.evidence.validate import validate_assessment_payload
 from app.execution.runs import run_view
@@ -67,6 +68,7 @@ async def build_assessment(app, interview_id: str):
         )
         entries = _entries_from_payload(payload)
     _store_findings(conn, interview_id, assessment["id"], entries)
+    apply_open_disputes(conn, bus, interview_id)
 
     repo.update_interview(conn, interview_id, model_id=llm.model_id)
     emit(

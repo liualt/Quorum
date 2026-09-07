@@ -39,11 +39,14 @@ mutations = APIRouter(
 
 #: Everything `/start` records about the conversation the agent joins.
 AGORA_COLUMNS = ("agora_channel", "agora_agent_id", "agora_uid", "agora_agent_uid")
-#: The statuses `/finish` may take an interview out of.
-FINISHABLE_STATUSES = ("created", "live")
+#: The statuses `/finish` may take an interview out of. `finishing` is an attempt
+#: that did not complete (a crash, a restart): it is picked up, not refused.
+FINISHABLE_STATUSES = ("created", "live", "finishing")
 #: How long `/finish` waits for a run in flight before assessing without it.
 FINISH_RUN_WAIT_SECONDS = 25.0
 FINISH_POLL_SECONDS = 0.5
+#: How long `/finish` gives Agora to stop the agent before assessing without waiting.
+VOICE_STOP_TIMEOUT_SECONDS = 10.0
 
 
 def initial_state_json() -> str:
@@ -268,23 +271,37 @@ async def finish_interview(
 ) -> dict:
     """Stop the voice, let the work in flight settle, and produce the assessment.
 
-    The status moves to `finishing` under the interview's lock, so a double
-    click gets a 409 rather than a second assessment, and a finished interview
-    answers with the assessment it already has.
+    The whole sequence runs under a per-interview finish lock, so a double
+    click waits for the first attempt and answers with its assessment. An
+    attempt that fell over partway leaves `finishing` behind; the next call
+    resumes it: every step is safe to repeat, and an assessment that was
+    already stored is kept rather than rebuilt.
     """
     app = request.app
+    async with _finish_lock(app, interview_id):
+        current = repo.get_interview(app.state.db, interview_id) or row
+        assessment = repo.latest_assessment(app.state.db, interview_id)
+        if current["status"] == "finished":
+            return _finish_response(assessment)
+        if current["status"] not in FINISHABLE_STATUSES:
+            raise HTTPException(409, "this interview cannot be finished")
+        if assessment is None:
+            assessment = await _finish(app, interview_id, current)
+        _mark_finished(app, interview_id, current)
+        return _finish_response(assessment)
+
+
+def _finish_lock(app, interview_id: str) -> asyncio.Lock:
+    return app.state.finish_locks.setdefault(interview_id, asyncio.Lock())
+
+
+async def _finish(app, interview_id: str, current):
+    """The sequence from `finishing` to a stored assessment."""
     controller = app.state.controller
     async with controller.interview_lock(interview_id):
-        current = repo.get_interview(app.state.db, interview_id) or row
-        if current["status"] == "finished":
-            return _finish_response(repo.latest_assessment(app.state.db, interview_id))
-        if current["status"] not in FINISHABLE_STATUSES:
-            raise HTTPException(409, "this interview is already finishing")
         repo.update_interview(app.state.db, interview_id, status="finishing")
 
-    voice = getattr(app.state, "voice", None)
-    if voice is not None and current["agora_agent_id"]:
-        await voice.stop_agent(current["agora_agent_id"])
+    await _stop_voice(app, current)
     await _wait_for_active_run(app, interview_id)
     # Every claim the record should hold is still being read from the last turns.
     await asyncio.gather(*background.pending(app, CLAIMS_TASK_PREFIX), return_exceptions=True)
@@ -295,14 +312,36 @@ async def finish_interview(
         controller.save_state(interview_id, state)
         emit(app.state.db, app.state.bus, interview_id, "stage_changed", {"stage": "assessment"})
 
-    assessment = await build_assessment(app, interview_id)
-    repo.update_interview(app.state.db, interview_id, status="finished", finished_at=ids.now_iso())
+    return await build_assessment(app, interview_id)
+
+
+def _mark_finished(app, interview_id: str, current) -> None:
+    repo.update_interview(
+        app.state.db,
+        interview_id,
+        status="finished",
+        finished_at=current["finished_at"] or ids.now_iso(),
+    )
     emit(app.state.db, app.state.bus, interview_id, "interview_finished", {})
-    return _finish_response(assessment)
 
 
 def _finish_response(assessment) -> dict:
     return {"assessment_id": assessment["id"], "status": assessment["status"]}
+
+
+async def _stop_voice(app, current) -> None:
+    """Hang up the agent, for a bounded time: the assessment does not wait on Agora."""
+    voice = getattr(app.state, "voice", None)
+    agent_id = current["agora_agent_id"]
+    if voice is None or not agent_id:
+        return
+    try:
+        await asyncio.wait_for(voice.stop_agent(agent_id), timeout=VOICE_STOP_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning(
+            "finishing %s: the voice agent %s did not stop within %ss",
+            current["id"], agent_id, VOICE_STOP_TIMEOUT_SECONDS,
+        )
 
 
 async def _wait_for_active_run(app, interview_id: str) -> None:
