@@ -109,7 +109,10 @@ class LocalExecutor:
             )
             try:
                 stdout, stderr = process.communicate(input=script, timeout=timeout_s)
-                status = "completed" if process.returncode == 0 else "failed"
+                # A non-zero exit is still `completed`: the runner ran, and
+                # whether its output is usable is `parse_output`'s call. Same
+                # rule as the E2B path.
+                status = "completed"
                 exit_code = process.returncode
             except subprocess.TimeoutExpired:
                 _kill_process_group(process)

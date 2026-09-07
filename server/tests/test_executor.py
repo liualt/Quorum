@@ -76,12 +76,17 @@ async def test_local_executor_caps_output():
     assert len(result.stdout) == 100 + len(TRUNCATION_MARKER)
 
 
-async def test_local_executor_reports_a_non_zero_exit_as_failed():
+async def test_local_executor_reports_a_non_zero_exit_as_completed():
+    """The runner ran, so the exit code does not decide: `parse_output` does.
+
+    Same rule as the E2B path, so a run's status means one thing whichever
+    executor produced it.
+    """
     files = {"runner.py": "import sys\nsys.stdin.read()\nsys.stderr.write('nope')\nsys.exit(3)\n"}
 
     result = await LocalExecutor().run(files, "{}", timeout_s=20, output_cap=1000)
 
-    assert result.status == "failed"
+    assert result.status == "completed"
     assert result.exit_code == 3
     assert result.stderr == "nope"
 
