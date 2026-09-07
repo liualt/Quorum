@@ -14,7 +14,13 @@ import pytest
 
 from app import ids
 from app.interview import controller as controller_module
-from app.interview.controller import ENDED_TEXT, RECOVERY_TEXT, InterviewController
+from app.interview.controller import (
+    ENDED_TEXT,
+    RECOVERY_TEXT,
+    IdScrubber,
+    InterviewController,
+    scrub_ids,
+)
 from app.interview.llm_client import LLMError
 from app.interview.state import ControllerState
 from app.storage import repo
@@ -742,3 +748,27 @@ async def test_a_proactive_follow_up_is_dropped_when_a_turn_started_in_between(l
         repo.get_interview(live_app.state.db, row["id"])["state_json"]
     ).generation
     assert after == before  # the streaming turn was not interrupted
+
+
+# The panel says words, never record ids (PRD section 9). The scrubber runs over
+# a stream, so an id can arrive split across chunks, and ordinary words must not
+# be held back waiting for a boundary that may never come.
+
+
+def test_the_scrubber_takes_ids_out_of_what_is_spoken():
+    assert scrub_ids("I ran seg_0123456789abcdef and it passed") == "I ran and it passed"
+    assert scrub_ids("the cache key") == "the cache key"
+
+
+def test_the_scrubber_catches_an_id_split_across_chunks():
+    scrubber = IdScrubber()
+    spoken = "".join(scrubber.feed(chunk) for chunk in ["Look at run_", "0123456789ab", "cdef now"])
+    assert "run_0123456789abcdef" not in spoken + scrubber.flush()
+
+
+def test_the_scrubber_does_not_hold_back_ordinary_words():
+    scrubber = IdScrubber()
+    # Words go out as they arrive: holding a fixed number of characters would
+    # stall the first words of every turn until the stream ended.
+    assert scrubber.feed("Technical") == "Technical"
+    assert scrubber.feed(" interviewer here,") == " interviewer here,"

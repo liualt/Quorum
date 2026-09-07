@@ -78,10 +78,11 @@ def segment_view(row) -> dict:
 
 #: Record ids the panel must never say out loud (PRD section 9: ids live in the
 #: record, not in the words). Every prefix `app.ids` mints, and its 16 hex digits.
-ID_PATTERN = re.compile(r"\b(?:seg|run|clm|snap|itv|dsp|fnd|asm)_[0-9a-f]{16}\b")
-#: The longest an id can be, so a scrubber holding back this much of its buffer
-#: can never emit the first half of one it has not finished reading.
-_ID_MAX_LEN = 21
+_ID_PREFIXES = ("seg", "run", "clm", "snap", "itv", "dsp", "fnd", "asm")
+ID_PATTERN = re.compile(r"\b(?:" + "|".join(_ID_PREFIXES) + r")_[0-9a-f]{16}\b")
+#: The trailing run of characters an id could still be growing out of.
+_TAIL = re.compile(r"[0-9a-z_]+$")
+_HEX = set("0123456789abcdef")
 
 
 def scrub_ids(text: str) -> str:
@@ -89,11 +90,32 @@ def scrub_ids(text: str) -> str:
     return re.sub(r"  +", " ", ID_PATTERN.sub("", text))
 
 
+def _unfinished_id(buffer: str) -> int:
+    """How many trailing characters could still turn into an id.
+
+    Only a token that is on its way to being one is held back — `"cache"` or
+    `"Technical"` go out immediately, `"run_1a2b"` waits for the rest. Holding a
+    fixed number of characters instead would stall the first words of every turn
+    behind a boundary that has not arrived yet.
+    """
+    match = _TAIL.search(buffer)
+    if match is None:
+        return 0
+    token = match.group(0)
+    for prefix in _ID_PREFIXES:
+        start = prefix + "_"
+        growing_into_the_prefix = start.startswith(token)
+        growing_into_the_digits = token.startswith(start) and set(token[len(start) :]) <= _HEX
+        if growing_into_the_prefix or growing_into_the_digits:
+            return len(token)
+    return 0
+
+
 class IdScrubber:
     """`scrub_ids` over a stream, where an id can straddle two chunks.
 
-    The tail of the buffer is held back until enough has arrived to tell an id
-    from a word that merely starts like one.
+    Only the part of the tail that could still become an id is held back, so a
+    turn's words reach the listener as they arrive.
     """
 
     def __init__(self) -> None:
@@ -101,9 +123,11 @@ class IdScrubber:
 
     def feed(self, chunk: str) -> str:
         self._buffer += chunk
-        if len(self._buffer) <= _ID_MAX_LEN:
+        hold = _unfinished_id(self._buffer)
+        if hold == len(self._buffer):
             return ""
-        emit, self._buffer = self._buffer[:-_ID_MAX_LEN], self._buffer[-_ID_MAX_LEN:]
+        cut = len(self._buffer) - hold
+        emit, self._buffer = self._buffer[:cut], self._buffer[cut:]
         return scrub_ids(emit)
 
     def flush(self) -> str:
