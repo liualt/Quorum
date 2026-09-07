@@ -317,7 +317,7 @@ InterviewView {id, display_name, status, stage, active_role, paused, created_at,
   me: "candidate"|"reviewer", model_id, voice_enabled: bool, voice_status,
   scenario: {id, version, brief, editable_files: {name: content}, readonly_files: {name: content}, checks: [CheckView]},
   latest_snapshot_id: str|null, runs_used: int, run_limit: int, session_cap_minutes: int}
-JoinView {enabled: bool, app_id, channel, uid: int, token, agent_uid: int, agent_id}
+JoinView {enabled: bool, app_id, channel, uid: int, token, agent_uid: int, agent_id, reason?: str}   # reason present only when enabled is false because the agent failed to start
 SnapshotView {id, files: {name: content}, content_hash, byte_size, created_at}
 RunView {id, snapshot_id, status, check_ids: [str], results: [CheckResultDict]|null, executor, sandbox_id,
   started_at, finished_at, replay_of, differs_from_original: bool|null, fixture_version, check_version,
@@ -436,7 +436,7 @@ class InterviewController:
 class JoinData: enabled: bool; app_id: str = ""; channel: str = ""; uid: int = 0; token: str = ""; agent_uid: int = 0; agent_id: str = ""
 class VoiceService(Protocol):
     enabled: bool
-    def make_join(self, interview_id: str) -> JoinData
+    def make_join(self, interview_id: str, *, uid: int | None = None, agent_uid: int | None = None, agent_id: str = "") -> JoinData   # pass the stored uids to rejoin a running agent with a fresh token
     async def start_agent(self, join: JoinData, *, llm_url: str, llm_token: str, greeting: str, instructions: str) -> str
     async def stop_agent(self, agent_id: str) -> None
     async def say(self, agent_id: str, text: str, *, interrupt: bool = False) -> None
